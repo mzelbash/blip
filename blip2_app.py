@@ -1,1052 +1,1366 @@
 """
-BLIP-2 Interactive Implementation Walkthrough
+BLIP-2 Interactive Walkthrough
 SEAS 8525: Computer Vision and Generative AI
-Dr. Elbasheer -- Week 6
+Dr. Elbasheer, Week 6
 
-Setup:
-    pip install streamlit torch torchvision transformers
-    pip install matplotlib seaborn pillow numpy accelerate
-
-Run:
+Run locally:
+    pip install -r requirements.txt
     streamlit run blip2_app.py
 
 Notes:
-    Model: Salesforce/blip2-opt-2.7b (~3.7GB download on first run)
-    GPU strongly recommended -- CPU inference takes 20-40 seconds per call.
-    On first launch the model downloads automatically from HuggingFace.
+    Model: Salesforce/blip2-opt-2.7b (about 3.8B parameters).
+    It loads only when a student presses a ▶ button; every diagram works without it.
+    GPU recommended. On CPU it needs about 16 GB of RAM and 20 to 40 seconds per answer.
 
-On Google Colab (GPU runtime recommended):
-    !pip install streamlit pyngrok transformers accelerate torch torchvision
-    !streamlit run blip2_app.py &
-    from pyngrok import ngrok
-    print(ngrok.connect(8501))
+Sample images:
+    Put your own images in a folder named "samples" next to this file and they
+    become the default gallery. The file name is the label.
+    Without that folder the app loads a few COCO validation images.
 """
 
+import base64
+import io
+import urllib.request
+from pathlib import Path
+
+import numpy as np
+import pandas as pd
 import streamlit as st
 import torch
-import numpy as np
-import matplotlib.pyplot as plt
-import matplotlib.colors as mcolors
-import warnings
-warnings.filterwarnings("ignore")
+from PIL import Image, ImageDraw
+from transformers import Blip2Config, Blip2ForConditionalGeneration, Blip2Processor
 
-from PIL import Image
-from transformers import Blip2Processor, Blip2ForConditionalGeneration
+MODEL_ID = "Salesforce/blip2-opt-2.7b"
+CLIP_ID = "openai/clip-vit-base-patch32"
 
-# ── PAGE CONFIG ───────────────────────────────────────────────────────────────
 st.set_page_config(
-    page_title="BLIP-2 Walkthrough | SEAS 8525",
+    page_title="BLIP-2 Walkthrough · SEAS 8525",
     page_icon="🧠",
     layout="wide",
     initial_sidebar_state="expanded",
 )
 
-# ── SIDEBAR WIDTH STATE ───────────────────────────────────────────────────────
-if "sidebar_width" not in st.session_state:
-    st.session_state.sidebar_width = 280
+# ═════════════════════════════════════════════════════════════════════════════
+# DESIGN TOKENS (house style: Lexend, navy titles, gold tags, light panels)
+# ═════════════════════════════════════════════════════════════════════════════
+NAVY = "#002147"
+GOLD = "#FFC400"
+BG = "#F3F6FB"
+BORDER = "#D9E1EC"
+INK = "#1E293B"
+MUTED = "#64748B"
 
-# ── THEME ─────────────────────────────────────────────────────────────────────
-st.markdown(f"""
-<style>
-    [data-testid="stSidebar"] {{
-        min-width: {st.session_state.sidebar_width}px !important;
-        max-width: {st.session_state.sidebar_width}px !important;
-        width:     {st.session_state.sidebar_width}px !important;
-        background: #1A2F4A;
-        border-right: 2px solid #0D2B4E;
-        transition: width 0.15s ease;
-    }}
-</style>
-""", unsafe_allow_html=True)
+IMG, IMG_BG = "#1D4ED8", "#E3ECFF"        # image side = blue
+TXT, TXT_BG = "#0E9F6E", "#DDF5EC"        # text side = green
+PROJ, PROJ_BG = "#D97706", "#FFF2DB"      # projection = orange
+SPACE, SPACE_BG = "#7C3AED", "#F1EAFE"    # shared space = purple
+POS, POS_BG = "#0E9F6E", "#CFEFDF"        # matching pair
+NEG, NEG_BG = "#E11D48", "#FDE2E8"        # non-matching pair
 
-st.markdown("""
-<style>
-    /* Base */
-    [data-testid="stAppViewContainer"] { background: #F7F9FC; color: #1A2332; }
-    [data-testid="stSidebar"] {
-        background: #1A2F4A;
-        border-right: 2px solid #0D2B4E;
-        transition: width 0.15s ease;
-    }
-    [data-testid="stSidebar"] * { color: #E8EFF7 !important; }
-    [data-testid="stSidebar"] .stCodeBlock,
-    [data-testid="stSidebar"] pre,
-    [data-testid="stSidebar"] code {
-        background: #0A1628 !important;
-        color: #80CBC4 !important;
-        border: 1px solid #1E3A5F !important;
-        border-radius: 6px;
-    }
-    [data-testid="stSidebar"] .stRadio label { color: #CBD5E1 !important; }
+PAIR_COLORS = ["#1D4ED8", "#E11D48", "#D97706", "#0E9F6E",
+               "#7C3AED", "#0891B2", "#BE185D", "#4B5563"]
 
-    /* Main text */
-    h1 { color: #0D47A1 !important; font-family: Georgia, serif; }
-    h2 { color: #1565C0 !important; font-family: Georgia, serif; }
-    h3 { color: #1976D2 !important; }
-    p, li { color: #1A2332; font-size: 15px; line-height: 1.7; }
+CSS = """
+@import url('https://fonts.googleapis.com/css2?family=Lexend:wght@400;500;600;700;800&family=JetBrains+Mono:wght@400;500&display=swap');
 
-    /* Info boxes */
-    .concept-box {
-        background: #E3F2FD;
-        border-left: 5px solid #0097A7;
-        border-radius: 6px;
-        padding: 16px 20px;
-        margin: 12px 0;
-        color: #0D2B4E;
-        font-size: 14px;
-        line-height: 1.7;
-    }
-    .highlight-box {
-        background: #EDE7F6;
-        border-left: 5px solid #5E35B1;
-        border-radius: 6px;
-        padding: 16px 20px;
-        margin: 12px 0;
-        color: #1A0050;
-        font-size: 14px;
-        line-height: 1.7;
-    }
-    .warning-box {
-        background: #FFF8E1;
-        border-left: 5px solid #F9A825;
-        border-radius: 6px;
-        padding: 14px 18px;
-        margin: 12px 0;
-        color: #3E2723;
-        font-size: 13px;
-    }
-    .success-box {
-        background: #E8F5E9;
-        border-left: 5px solid #2E7D32;
-        border-radius: 6px;
-        padding: 14px 18px;
-        margin: 12px 0;
-        color: #1B3A1C;
-        font-size: 13px;
-    }
-    .metric-card {
-        background: #FFFFFF;
-        border: 2px solid #BBDEFB;
-        border-radius: 10px;
-        padding: 16px;
-        text-align: center;
-        margin: 6px 0;
-        box-shadow: 0 2px 6px rgba(0,0,0,0.08);
-    }
-    .metric-val {
-        font-size: 26px;
-        font-weight: bold;
-        color: #0D47A1;
-    }
-    .metric-label {
-        font-size: 12px;
-        color: #607D8B;
-        margin-top: 4px;
-    }
-    .section-tag {
-        display: inline-block;
-        background: #0097A7;
-        color: white;
-        padding: 3px 12px;
-        border-radius: 12px;
-        font-size: 11px;
-        font-weight: bold;
-        letter-spacing: 1px;
-        margin-bottom: 8px;
-    }
-    /* Code blocks: white background, readable */
-    .stCodeBlock, pre, code {
-        background: #F1F5F9 !important;
-        color: #1E293B !important;
-        border: 1px solid #CBD5E1 !important;
-        border-radius: 6px;
-    }
-    .stButton > button {
-        background: #1565C0;
-        color: white;
-        border: none;
-        border-radius: 6px;
-        font-weight: bold;
-        padding: 8px 20px;
-    }
-    .stButton > button:hover { background: #1976D2; }
-    hr { border-color: #BBDEFB; }
-    [data-testid="stFileUploader"] { background: #FFFFFF; border-radius: 8px; }
-</style>
-""", unsafe_allow_html=True)
+html, body, p, li, label, input, textarea, button, h1, h2, h3, h4,
+.stMarkdown, [data-testid="stWidgetLabel"], [data-testid="stExpander"] summary p {
+    font-family: 'Lexend', system-ui, sans-serif !important;
+}
+code, pre, .stCode code { font-family: 'JetBrains Mono', monospace !important; }
+
+[data-testid="stAppViewContainer"] { background: #F3F6FB; }
+[data-testid="stHeader"] { background: transparent; }
+.block-container { padding-top: 1.6rem; padding-bottom: 2.5rem; max-width: 1320px; }
+footer, [data-testid="stDecoration"] { display: none; }
+[data-testid="stSidebar"] { background: #FFFFFF; border-right: 1px solid #D9E1EC; }
+p, li { font-size: 16px; color: #1E293B; line-height: 1.6; }
+[data-testid="stExpander"] { background: #FFFFFF; border-radius: 12px; border-color: #D9E1EC; }
+
+/* section banner */
+.hero { background: #002147; border-radius: 16px; padding: 18px 28px 16px; margin: 4px 0 16px;
+        display: flex; align-items: center; gap: 16px; flex-wrap: wrap; }
+.hero .badge { background: #FFC400; color: #002147; font-weight: 800; font-size: 18px;
+        width: 40px; height: 40px; border-radius: 50%; display: flex; align-items: center; justify-content: center; }
+.hero .t { color: #FFFFFF; font-weight: 800; font-size: 32px; letter-spacing: -0.3px; }
+.hero .s { color: #C9D6EA; font-size: 17px; flex-basis: 100%; margin-left: 56px; margin-top: -6px; }
+
+/* takeaway box at the end of each section */
+.key { background: #FFFFFF; border: 1px solid #D9E1EC; border-top: 6px solid #FFC400;
+       border-radius: 16px; padding: 22px 36px; margin: 22px auto 10px; text-align: center;
+       box-shadow: 0 4px 14px rgba(0, 33, 71, 0.08); }
+.key .x { font-size: 21px; font-weight: 500; color: #002147; line-height: 1.6; max-width: 980px; margin: 0 auto; }
+.key .x b { font-weight: 800; }
+
+/* top navigation: big, clear section buttons */
+.st-key-topnav { background: #FFFFFF; border: 1px solid #D9E1EC; border-radius: 16px; padding: 10px 12px;
+                 box-shadow: 0 2px 10px rgba(0, 33, 71, 0.06); margin-bottom: 4px; }
+.st-key-topnav [data-testid="stButtonGroup"], .st-key-topnav [data-testid="stButtonGroup"] > div { width: 100%; }
+.st-key-topnav [data-testid="stButtonGroup"] button { flex: 1 1 0; min-height: 54px; padding: 8px 14px;
+                 border-radius: 12px !important; border: 1.5px solid #D9E1EC; background: #F3F6FB; }
+.st-key-topnav [data-testid="stButtonGroup"] button p { font-size: 18px !important; font-weight: 700 !important; color: #002147; }
+.st-key-topnav [data-testid="stButtonGroup"] button:hover { border-color: #002147; }
+.st-key-topnav [data-testid="stBaseButton-segmented_controlActive"] { background: #002147 !important; border-color: #002147 !important; }
+.st-key-topnav [data-testid="stBaseButton-segmented_controlActive"] p { color: #FFC400 !important; }
+.st-key-topnav [role="radiogroup"] label p { font-size: 18px !important; font-weight: 700; color: #002147; }
+
+/* "by the numbers" fact cards */
+.facts { display: grid; grid-template-columns: 1.35fr 1fr 1fr; gap: 14px; margin: 6px 0 4px; }
+@media (max-width: 1000px) { .facts { grid-template-columns: 1fr; } }
+.fgroup { background: #FFFFFF; border: 1px solid #D9E1EC; border-radius: 16px; padding: 14px 16px; }
+.fgroup .gh { font-weight: 800; font-size: 16px; margin-bottom: 2px; }
+.fgroup .gs { font-size: 13px; color: #64748B; margin-bottom: 10px; }
+.fact { padding: 10px 0; border-top: 1px solid #EEF2F7; }
+.fact .n { font-size: 32px; font-weight: 800; line-height: 1.1; white-space: nowrap; }
+.fact .k { font-weight: 700; font-size: 15.5px; margin-top: 2px; color: #002147; }
+.fact .d { font-size: 13.5px; color: #475569; line-height: 1.45; margin-top: 2px; }
+
+/* small stat chips */
+.chips { display: flex; gap: 12px; flex-wrap: wrap; margin: 4px 0 12px; }
+.chip { background: #FFFFFF; border: 1px solid #D9E1EC; border-radius: 14px; padding: 10px 18px; min-width: 150px; }
+.chip b { display: block; font-size: 24px; font-weight: 800; color: #002147; }
+.chip span { font-size: 13px; color: #64748B; }
+
+/* panels and pipelines */
+.panel { background: #FFFFFF; border: 1px solid #D9E1EC; border-radius: 16px; padding: 18px 20px; margin: 6px 0 10px; }
+.ptitle { font-weight: 700; color: #002147; font-size: 17px; margin-bottom: 10px; display: flex; gap: 10px; align-items: center; }
+.tag { display: inline-block; border-radius: 999px; padding: 2px 12px; font-size: 13px; font-weight: 700; }
+.pipe { display: flex; align-items: center; gap: 6px; flex-wrap: nowrap; overflow-x: auto; padding-bottom: 2px; }
+.pipe > * { flex-shrink: 0; }
+.arrow { font-size: 22px; color: #94A3B8; font-weight: 700; }
+.node { border-radius: 12px; padding: 8px 11px; text-align: center; font-weight: 700; font-size: 14px; line-height: 1.3; }
+.node small { display: block; font-weight: 500; color: #64748B; font-size: 12px; margin-top: 2px; }
+.n-img  { background: #E3ECFF; border: 2px solid #1D4ED8; color: #1D4ED8; }
+.n-txt  { background: #DDF5EC; border: 2px solid #0E9F6E; color: #0B7A55; }
+.n-proj { background: #FFF2DB; border: 2px solid #D97706; color: #B45309; }
+.n-space{ background: #F1EAFE; border: 2px solid #7C3AED; color: #6D28D9; }
+.n-plain{ background: #FFFFFF; border: 1px dashed #94A3B8; color: #1E293B; }
+.thumb { border-radius: 10px; display: block; }
+
+/* token sequences */
+.seq { display: flex; gap: 4px; align-items: center; flex-wrap: wrap; justify-content: center; }
+.seq img { width: 24px; height: 24px; border-radius: 4px; border: 1px solid #93B4F5; }
+.tk { display: inline-block; border-radius: 8px; padding: 3px 7px; font-size: 13px; font-weight: 600;
+      background: #FFFFFF; border: 1.5px solid #0E9F6E; color: #0B7A55; }
+.tk.sp { background: #F1F5F9; border-color: #94A3B8; color: #475569; }
+.tk.eot { background: #0E9F6E; border-color: #0E9F6E; color: #FFFFFF; }
+.tk.cls { background: #1D4ED8; border-color: #1D4ED8; color: #FFFFFF; }
+
+/* embedding strips */
+.strip { display: flex; gap: 1px; }
+.strip i { display: block; width: 8px; height: 30px; border-radius: 2px; }
+.grid5 { display: grid; grid-template-columns: auto 34px auto 34px 1fr; gap: 12px 6px; align-items: center; }
+.slabel { font-size: 12.5px; color: #64748B; margin-top: 4px; font-weight: 500; }
+
+/* similarity matrix */
+table.mx { border-collapse: separate; border-spacing: 6px; margin: 0 auto; }
+table.mx td { width: 104px; height: 74px; text-align: center; border-radius: 10px; font-size: 19px;
+              color: #1E293B; border: 1px solid rgba(0,0,0,0.06); }
+table.mx td.d { font-weight: 800; }
+table.mx td.win { box-shadow: inset 0 0 0 3px #002147; }
+table.mx th { font-weight: 600; font-size: 14px; color: #1E293B; }
+table.mx th.col span { display: block; border-radius: 10px; padding: 6px 8px; border: 2px solid; line-height: 1.25; }
+table.mx th.row { text-align: left; }
+table.mx th.row div { display: flex; align-items: center; gap: 8px; }
+table.mx th.row img { width: 66px; height: 66px; object-fit: cover; border-radius: 10px; border: 3px solid; }
+
+/* zero-shot step cards */
+.steps { display: grid; grid-template-columns: repeat(4, 1fr); gap: 12px; }
+@media (max-width: 1000px) { .steps { grid-template-columns: 1fr 1fr; } }
+.step { background: #FFFFFF; border: 1px solid #D9E1EC; border-radius: 16px; padding: 14px; }
+.step h4 { margin: 0 0 12px 0; padding: 8px 12px; border-radius: 10px; font-size: 17px; font-weight: 700; }
+.bar { display: grid; grid-template-columns: 1fr 62px; gap: 6px; align-items: center; margin: 5px 0; font-size: 14px; }
+.bar .track { background: #F1F5F9; border-radius: 6px; height: 26px; position: relative; overflow: hidden; }
+.bar .fill { height: 100%; border-radius: 6px; }
+.bar .lab { position: absolute; left: 8px; top: 3px; font-weight: 600; color: #1E293B; white-space: nowrap; }
+.bar .v { text-align: right; font-weight: 700; font-family: 'JetBrains Mono', monospace; font-size: 13.5px; }
+
+/* sidebar gallery */
+.gal { display: grid; grid-template-columns: repeat(3, 1fr); gap: 6px; }
+.gal div { font-size: 11px; color: #475569; text-align: center; overflow: hidden; white-space: nowrap; text-overflow: ellipsis; }
+.gal img { width: 100%; aspect-ratio: 1; object-fit: cover; border-radius: 8px; }
+"""
+st.markdown(f"<style>{CSS}</style>", unsafe_allow_html=True)
 
 
-# ── MODEL LOADING ─────────────────────────────────────────────────────────────
-@st.cache_resource(show_spinner=True)
+# ═════════════════════════════════════════════════════════════════════════════
+# SMALL HTML HELPERS
+# ═════════════════════════════════════════════════════════════════════════════
+def html(s: str):
+    """Render an HTML snippet. Lines are joined so Markdown never sees
+    indentation or blank lines (which would break the HTML)."""
+    one_line = " ".join(line.strip() for line in s.splitlines() if line.strip())
+    st.markdown(f"<div>{one_line}</div>", unsafe_allow_html=True)
+
+
+def esc(s: str) -> str:
+    return (str(s).replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+            .replace('"', "&quot;").replace("$", "&#36;"))
+
+
+def hero(num, title, subtitle):
+    html(f'<div class="hero"><div class="badge">{num}</div><div class="t">{title}</div>'
+         f'<div class="s">{subtitle}</div></div>')
+
+
+def key_idea(text):
+    html(f'<div class="key"><div class="x">{text}</div></div>')
+
+
+def chips(items):
+    inner = "".join(f'<div class="chip"><b>{v}</b><span>{k}</span></div>' for v, k in items)
+    html(f'<div class="chips">{inner}</div>')
+
+
+def mix(c1, c2, t):
+    t = float(np.clip(t, 0, 1))
+    a = [int(c1[i:i + 2], 16) for i in (1, 3, 5)]
+    b = [int(c2[i:i + 2], 16) for i in (1, 3, 5)]
+    return "#" + "".join(f"{round(x + (y - x) * t):02X}" for x, y in zip(a, b))
+
+
+def val_color(t, pos_color):
+    """t in [-1, 1]: positive values tint toward pos_color, negative toward red."""
+    return mix("#FFFFFF", pos_color, t) if t >= 0 else mix("#FFFFFF", NEG, -t)
+
+
+def strip_html(vec, color, n=64):
+    v = np.asarray(vec[:n], dtype=float)
+    m = max(float(np.abs(v).max()), 1e-6)
+    cells = "".join(f'<i style="background:{val_color(x / m, color)}"></i>' for x in v)
+    return f'<div class="strip">{cells}</div>'
+
+
+def article(word):
+    return "an" if word[:1].lower() in "aeiou" else "a"
+
+
+def seg(label, options, key, default=None):
+    """Segmented control with a radio fallback for older Streamlit versions."""
+    if key not in st.session_state:
+        st.session_state[key] = default or options[0]
+    if hasattr(st, "segmented_control"):
+        val = st.segmented_control(label, options, key=key)
+    else:
+        val = st.radio(label, options, key=key, horizontal=True)
+    return val or options[0]
+
+
+def code_panel(title, code):
+    with st.expander(f"💻  Code · {title}", expanded=False):
+        st.code(code, language="python")
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# IMAGES
+# ═════════════════════════════════════════════════════════════════════════════
+IMG_EXT = {".png", ".jpg", ".jpeg", ".webp"}
+
+COCO = "http://images.cocodataset.org/val2017/"
+SAMPLE_URLS = [
+    ("cat", "two cats sleeping on a couch", COCO + "000000039769.jpg"),
+    ("bear", "a brown bear sitting in the grass", COCO + "000000000285.jpg"),
+    ("stop sign", "a red stop sign by the road", COCO + "000000000724.jpg"),
+    ("skier", "a person skiing down a snowy slope", COCO + "000000000785.jpg"),
+    ("teddy bear", "a group of teddy bears", COCO + "000000000776.jpg"),
+    ("kitchen", "a kitchen with a refrigerator", COCO + "000000000802.jpg"),
+    ("bedroom", "a bedroom with a bed", COCO + "000000000632.jpg"),
+    ("living room", "a living room with a couch and a tv", COCO + "000000000139.jpg"),
+]
+
+
+@st.cache_data(show_spinner=False)
+def fetch_bytes(url):
+    try:
+        req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+        with urllib.request.urlopen(req, timeout=15) as r:
+            return r.read()
+    except Exception:
+        return None
+
+
+@st.cache_data(show_spinner=False, max_entries=128)
+def to_pil(b: bytes) -> Image.Image:
+    return Image.open(io.BytesIO(b)).convert("RGB")
+
+
+def clip_crop(img, size=224):
+    """Resize the short side to `size`, then center crop (what CLIPProcessor does)."""
+    w, h = img.size
+    s = size / min(w, h)
+    img = img.resize((max(size, round(w * s)), max(size, round(h * s))), Image.BICUBIC)
+    w, h = img.size
+    l, t = (w - size) // 2, (h - size) // 2
+    return img.crop((l, t, l + size, t + size))
+
+
+def pil_uri(img, fmt="JPEG", quality=85):
+    buf = io.BytesIO()
+    img.save(buf, format=fmt, quality=quality)
+    return f"data:image/{fmt.lower()};base64," + base64.b64encode(buf.getvalue()).decode()
+
+
+@st.cache_data(show_spinner=False, max_entries=256)
+def thumb_uri(b: bytes, size=160):
+    return pil_uri(clip_crop(to_pil(b), size))
+
+
+def build_pool(uploads):
+    """Ordered dict: label -> {"bytes", "caption"}."""
+    pool = {}
+
+    def add(label, caption, data):
+        name, k = label, 2
+        while name in pool:
+            name = f"{label} ({k})"
+            k += 1
+        pool[name] = {"bytes": data, "caption": caption}
+
+    local = Path(__file__).parent / "samples"
+    files = sorted(p for p in local.glob("*") if p.suffix.lower() in IMG_EXT) if local.exists() else []
+    if files:
+        for p in files:
+            lbl = p.stem.replace("_", " ")
+            add(lbl, f"a photo of {article(lbl)} {lbl}", p.read_bytes())
+    else:
+        for lbl, cap, url in SAMPLE_URLS:
+            data = fetch_bytes(url)
+            if data:
+                add(lbl, cap, data)
+
+    for f in uploads or []:
+        lbl = Path(f.name).stem.replace("_", " ")
+        add(lbl, f"a photo of {article(lbl)} {lbl}", f.getvalue())
+    return pool
+
+
+
+BLIP_CSS = """
+.stButton > button[kind="primary"] { background: #002147; border: none; color: #FFFFFF; font-weight: 700;
+    font-size: 16px; padding: 10px 26px; border-radius: 12px; }
+.stButton > button[kind="primary"]:hover { background: #0B3A6E; color: #FFC400; }
+.stButton > button[kind="primary"] p { color: #FFFFFF; font-size: 16px; font-weight: 700; }
+.vt { display: inline-block; width: 16px; height: 16px; border-radius: 4px; background: #C4B5FD;
+      border: 1.5px solid #7C3AED; margin: 1px; vertical-align: middle; }
+.vt.big { width: 22px; height: 22px; }
+.tk.pr { background: #F1F5F9; border-color: #94A3B8; color: #334155; }
+.tk.fmt { background: #FFF2DB; border-color: #D97706; color: #B45309; }
+.tk.ans { background: #0E9F6E; border-color: #0E9F6E; color: #FFFFFF; }
+.flag { display: inline-block; border-radius: 999px; padding: 2px 10px; font-size: 12.5px; font-weight: 700; }
+.flag.fz { background: #E3ECFF; color: #1D4ED8; }
+.flag.tr { background: #FFE7D1; color: #C2410C; }
+.flag.na { background: #F1F5F9; color: #94A3B8; }
+.stack { display: flex; flex-direction: column; gap: 8px; position: relative; padding: 12px 14px;
+         border: 2px solid #D97706; border-radius: 14px; background: #FFF8EC; }
+.blk { border-radius: 10px; padding: 8px 12px; font-weight: 700; font-size: 14px; text-align: left; }
+.blk small { display: block; font-weight: 500; color: #475569; font-size: 12.5px; }
+.out { background: #FFFFFF; border: 1.5px solid #0E9F6E; border-left: 6px solid #0E9F6E; border-radius: 12px;
+       padding: 12px 16px; margin: 8px 0; font-size: 18px; color: #0F3D2E; }
+.out small { display: block; color: #64748B; font-size: 12.5px; font-weight: 600; margin-bottom: 2px; }
+.cards3 { display: grid; grid-template-columns: repeat(3, 1fr); gap: 12px; }
+@media (max-width: 1000px) { .cards3 { grid-template-columns: 1fr; } }
+.tiles { display: grid; grid-template-columns: repeat(8, 1fr); gap: 6px; }
+.tiles div { text-align: center; font-size: 11px; color: #475569; font-weight: 600; }
+.tiles img { width: 100%; border-radius: 6px; display: block; }
+table.cmp { width: 100%; border-collapse: separate; border-spacing: 0; background: #FFFFFF;
+            border: 1px solid #D9E1EC; border-radius: 14px; overflow: hidden; }
+table.cmp th, table.cmp td { padding: 10px 14px; text-align: left; font-size: 15px; border-bottom: 1px solid #EEF2F7; }
+table.cmp th { font-size: 16px; }
+table.cmp td:first-child { color: #64748B; font-weight: 600; width: 22%; }
+.pbar { display: flex; height: 42px; border-radius: 12px; overflow: hidden; border: 1px solid #D9E1EC; }
+.pbar div { display: flex; align-items: center; justify-content: center; color: #FFFFFF; font-weight: 700; font-size: 14px; }
+"""
+st.markdown(f"<style>{BLIP_CSS}</style>", unsafe_allow_html=True)
+
+
+def facts_panel(facts, note):
+    html(f'<div style="font-weight:800;font-size:20px;color:{NAVY};margin:14px 0 6px">{note[0]} '
+         f'<span style="font-weight:500;font-size:15px;color:{MUTED}">· {note[1]}</span></div>')
+    cols = ""
+    for title, sub, color, items in facts:
+        rows = "".join(f'<div class="fact"><div class="n" style="color:{color}">{n}</div>'
+                       f'<div><div class="k">{k}</div><div class="d">{esc(d)}</div></div></div>'
+                       for n, k, d in items)
+        cols += (f'<div class="fgroup" style="border-top:5px solid {color}"><div class="gh" style="color:{color}">{title}</div>'
+                 f'<div class="gs">{sub}</div>{rows}</div>')
+    html(f'<div class="facts">{cols}</div>')
+
+
+def vtokens(n=8, total=32, big=False):
+    sq = "".join(f'<span class="vt{" big" if big else ""}"></span>' for _ in range(n))
+    more = f'<span style="color:{MUTED};font-weight:700;margin-left:4px">··· ×{total}</span>' if total > n else ""
+    return sq + more
+
+
+def wrap(text, width, max_lines):
+    lines, cur = [], ""
+    for w in str(text).split():
+        if len(cur) + len(w) + 1 > width and cur:
+            lines.append(cur)
+            cur = w
+        else:
+            cur = f"{cur} {w}".strip()
+    if cur:
+        lines.append(cur)
+    if len(lines) > max_lines:
+        lines = lines[:max_lines]
+        lines[-1] = lines[-1][: max(1, width - 1)] + "…"
+    return lines or [""]
+
+
+def grid_overlay(img, n):
+    g = img.copy()
+    d = ImageDraw.Draw(g)
+    w = img.size[0]
+    for k in range(n + 1):
+        x = round(k * w / n)
+        d.line([(x, 0), (x, w)], fill="white", width=1)
+        d.line([(0, x), (w, x)], fill="white", width=1)
+    return g
+
+
+def patches(img, n):
+    w = img.size[0]
+    p = w / n
+    return [img.crop((round(c * p), round(r * p), round((c + 1) * p), round((r + 1) * p)))
+            for r in range(n) for c in range(n)]
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# MODEL
+# ═════════════════════════════════════════════════════════════════════════════
+FALLBACK = dict(vis_hidden=1408, vis_layers=39, patch=14, image=224, q_hidden=768, q_layers=12, q_heads=12,
+                cross_freq=2, n_query=32, llm_hidden=2560, llm_layers=32, llm_vocab=50272)
+
+
+@st.cache_resource(show_spinner=False)
+def arch():
+    """Architecture numbers from the model's config.json only (a few KB, no weights)."""
+    try:
+        cfg = Blip2Config.from_pretrained(MODEL_ID)
+        vc, qc, tc = cfg.vision_config, cfg.qformer_config, cfg.text_config
+        a = dict(vis_hidden=vc.hidden_size, vis_layers=vc.num_hidden_layers, patch=vc.patch_size,
+                 image=vc.image_size, q_hidden=qc.hidden_size, q_layers=qc.num_hidden_layers,
+                 q_heads=qc.num_attention_heads, cross_freq=qc.cross_attention_frequency,
+                 n_query=cfg.num_query_tokens, llm_hidden=tc.hidden_size, llm_layers=tc.num_hidden_layers,
+                 llm_vocab=tc.vocab_size)
+    except Exception:
+        a = dict(FALLBACK)
+    a["side"] = a["image"] // a["patch"]
+    a["n_tok"] = a["side"] ** 2 + 1
+    return a
+
+
+@st.cache_resource(show_spinner="Loading BLIP-2 (first run downloads the weights, several GB)...")
 def load_blip2():
     device = "cuda" if torch.cuda.is_available() else "cpu"
-    dtype  = torch.float16 if device == "cuda" else torch.float32
-    processor = Blip2Processor.from_pretrained("Salesforce/blip2-opt-2.7b")
+    dtype = torch.float16 if device == "cuda" else torch.float32
+    processor = Blip2Processor.from_pretrained(MODEL_ID)
     model = Blip2ForConditionalGeneration.from_pretrained(
-        "Salesforce/blip2-opt-2.7b",
-        torch_dtype=dtype,
-        device_map="auto" if device == "cuda" else None,
-    )
+        MODEL_ID, torch_dtype=dtype, device_map="auto" if device == "cuda" else None)
     if device == "cpu":
         model = model.to(device)
     model.eval()
     return model, processor, device
 
 
-def generate_caption(model, processor, image, device, max_new_tokens=60):
+def model_loaded():
+    return st.session_state.get("_blip_loaded", False)
+
+
+def get_blip():
+    out = load_blip2()
+    st.session_state["_blip_loaded"] = True
+    return out
+
+
+def _clean(text, prompt):
+    t = text.strip()
+    if prompt:
+        p = prompt.strip()
+        if t.startswith(p):
+            t = t[len(p):]
+        if "Answer:" in t:
+            t = t.split("Answer:")[-1]
+    return t.strip() or "(no answer)"
+
+
+def blip_generate(img_bytes, prompt=None, max_new_tokens=40, do_sample=False, temperature=1.0, n=1):
+    model, processor, device = get_blip()
     dtype = torch.float16 if device == "cuda" else torch.float32
-    inputs = processor(images=image, return_tensors="pt").to(device, dtype)
+    kw = dict(images=to_pil(img_bytes), return_tensors="pt")
+    if prompt:
+        kw["text"] = prompt
+    inputs = processor(**kw).to(device, dtype)
+    gen = dict(max_new_tokens=max_new_tokens)
+    if do_sample:
+        gen.update(do_sample=True, temperature=temperature, top_p=0.9, num_return_sequences=n)
     with torch.no_grad():
-        out = model.generate(**inputs, max_new_tokens=max_new_tokens)
-    return processor.decode(out[0], skip_special_tokens=True).strip()
+        out = model.generate(**inputs, **gen)
+    return [_clean(t, prompt) for t in processor.batch_decode(out, skip_special_tokens=True)]
 
 
-def answer_question(model, processor, image, question, device, max_new_tokens=80):
+def query_attention(img_bytes):
+    """Cross-attention of the 32 queries over the image patches, averaged over heads and layers."""
+    model, processor, device = get_blip()
     dtype = torch.float16 if device == "cuda" else torch.float32
-    prompt = f"Question: {question} Answer:"
-    inputs = processor(
-        images=image, text=prompt, return_tensors="pt"
-    ).to(device, dtype)
+    pv = processor(images=to_pil(img_bytes), return_tensors="pt")["pixel_values"].to(device, dtype)
     with torch.no_grad():
-        out = model.generate(**inputs, max_new_tokens=max_new_tokens)
-    full = processor.decode(out[0], skip_special_tokens=True).strip()
-    # Strip the prompt prefix if echoed back
-    if "Answer:" in full:
-        full = full.split("Answer:")[-1].strip()
-    return full
+        img_emb = model.vision_model(pixel_values=pv).last_hidden_state
+        q = model.query_tokens.expand(img_emb.shape[0], -1, -1)
+        att = torch.ones(img_emb.shape[:-1], dtype=torch.long, device=img_emb.device)
+        out = model.qformer(query_embeds=q, encoder_hidden_states=img_emb, encoder_attention_mask=att,
+                            output_attentions=True, return_dict=True)
+    ca = [a for a in (getattr(out, "cross_attentions", None) or []) if a is not None]
+    if not ca:
+        raise RuntimeError("this transformers version does not return cross-attention weights")
+    A = torch.stack([a.float().mean(1) for a in ca]).mean(0)[0]       # [32, 257]
+    A = A[:, 1:].cpu().numpy()                                          # drop the CLS column
+    side = int(round(np.sqrt(A.shape[1])))
+    return A.reshape(A.shape[0], side, side)
 
 
-def make_fig(w=8, h=5):
-    fig, ax = plt.subplots(figsize=(w, h))
-    fig.patch.set_facecolor("#FFFFFF")
-    ax.set_facecolor("#F7F9FC")
-    for spine in ax.spines.values():
-        spine.set_edgecolor("#CBD5E1")
-    ax.tick_params(colors="#334155", labelsize=10)
-    ax.xaxis.label.set_color("#334155")
-    ax.yaxis.label.set_color("#334155")
-    ax.title.set_color("#0D47A1")
-    return fig, ax
+@st.cache_resource(show_spinner="Loading CLIP for the comparison...")
+def load_clip():
+    from transformers import CLIPModel, CLIPProcessor
+    m = CLIPModel.from_pretrained(CLIP_ID).eval()
+    p = CLIPProcessor.from_pretrained(CLIP_ID)
+    return m, p
 
 
-# ── SIDEBAR ───────────────────────────────────────────────────────────────────
+def _unit(x):
+    if not isinstance(x, torch.Tensor):
+        for name in ("image_embeds", "text_embeds", "pooler_output"):
+            v = getattr(x, name, None)
+            if v is not None:
+                x = v
+                break
+    return x / x.norm(dim=-1, keepdim=True)
+
+
+def clip_scores(img_bytes, prompts):
+    m, p = load_clip()
+    with torch.no_grad():
+        i = _unit(m.get_image_features(**p(images=[to_pil(img_bytes)], return_tensors="pt")))
+        t = _unit(m.get_text_features(**p(text=prompts, return_tensors="pt", padding=True)))
+        scale = float(m.logit_scale.exp().item())
+    s = (i @ t.T)[0].cpu().numpy()
+    return s, softmax_np(s * scale)
+
+
+def softmax_np(x):
+    e = np.exp(x - x.max())
+    return e / e.sum()
+
+
+def run_once(key, sig, fn):
+    """Run fn() when the button was pressed; keep its result while the inputs stay the same."""
+    try:
+        st.session_state[key] = {"sig": sig, "val": fn()}
+    except Exception as e:  # show the problem instead of crashing the page
+        st.session_state[key] = {"sig": sig, "err": f"{type(e).__name__}: {e}"}
+
+
+def result(key, sig):
+    r = st.session_state.get(key)
+    if r and r["sig"] == sig:
+        if "err" in r:
+            st.error(f"The model could not run here: {r['err']}")
+            return None
+        return r["val"]
+    return None
+
+
+def run_button(label, key):
+    return st.button(f"▶  {label}", key=key, type="primary")
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# SIDEBAR
+# ═════════════════════════════════════════════════════════════════════════════
 with st.sidebar:
-    st.session_state.sidebar_width = st.slider(
-        "Panel width", min_value=200, max_value=440,
-        value=st.session_state.sidebar_width, step=10,
-        help="Drag to resize the sidebar"
-    )
-    st.markdown("## 🧠 BLIP-2 Walkthrough")
-    st.markdown("**SEAS 8525** · Computer Vision and Generative AI")
-    st.markdown("*Dr. Elbasheer · Week 6*")
+    html(f'<div style="font-weight:800;font-size:22px;color:{NAVY}">🧠 BLIP-2 Walkthrough</div>'
+         f'<div style="margin-top:4px"><span class="tag" style="background:{GOLD};color:{NAVY}">SEAS 8525</span>'
+         f'<span style="color:{MUTED};font-size:14px;margin-left:8px">Week 6 · Dr. Elbasheer</span></div>')
     st.divider()
-
-    section = st.radio(
-        "Jump to section",
-        options=[
-            "1 · What is BLIP-2?",
-            "2 · The QFormer Bridge",
-            "3 · Image Captioning",
-            "4 · Visual Question Answering",
-            "5 · Prompt Engineering",
-            "6 · BLIP-2 vs CLIP",
-        ]
-    )
-    st.divider()
-
-    st.markdown("#### Quick Setup")
-    st.code(
-        "pip install streamlit torch torchvision\n"
-        "pip install transformers accelerate\n"
-        "pip install matplotlib pillow numpy\n\n"
-        "streamlit run blip2_app.py",
-        language="bash"
-    )
-
-    device_str = "cuda" if torch.cuda.is_available() else "cpu"
-    if device_str == "cuda":
-        st.success(f"GPU ready: {torch.cuda.get_device_name(0)}")
+    st.markdown("**Image gallery**")
+    st.caption("Every section picks images from here. Add your own below.")
+    uploads = st.file_uploader("Add images", type=["png", "jpg", "jpeg", "webp"],
+                               accept_multiple_files=True, label_visibility="collapsed")
+    POOL = build_pool(uploads)
+    if POOL:
+        tiles = "".join(f'<div><img src="{thumb_uri(v["bytes"], 120)}"/>{esc(k)}</div>'
+                        for k, v in POOL.items())
+        html(f'<div class="gal">{tiles}</div>')
     else:
-        st.warning(
-            "Running on CPU. Each inference call takes 20-40 seconds. "
-            "GPU is strongly recommended for live demos."
-        )
+        st.warning("No sample images could be loaded. Upload a few images above.")
+    st.divider()
+    if model_loaded():
+        st.caption("✅ BLIP-2 is loaded.")
+    else:
+        st.caption("The model loads the first time you press a ▶ button. The diagrams work without it.")
+    if torch.cuda.is_available():
+        st.caption(f"⚡ GPU: {torch.cuda.get_device_name(0)}")
+    else:
+        st.caption("Running on CPU: each generation takes 20 to 40 seconds and needs about 16 GB of RAM.")
+    with st.expander("Run it locally"):
+        st.code("pip install -r requirements.txt\nstreamlit run blip2_app.py", language="bash")
+
+LABELS = list(POOL)
+A = arch()
+
+
+def need_images(k=1):
+    if len(LABELS) < k:
+        st.info(f"This section needs at least {k} image(s). Add some in the sidebar gallery.")
+        return True
+    return False
+
+
+def pick_image(key, label="Image", index=0):
+    return st.selectbox(label, LABELS, index=min(index, len(LABELS) - 1), key=key)
 
 
 # ═════════════════════════════════════════════════════════════════════════════
-# SECTION 1: WHAT IS BLIP-2?
+# SECTION 1 · BIG PICTURE
 # ═════════════════════════════════════════════════════════════════════════════
-if section.startswith("1"):
-    st.markdown('<span class="section-tag">SECTION 1</span>', unsafe_allow_html=True)
-    st.title("BLIP-2: Bootstrapping Language-Image Pre-training")
-    st.caption("Li et al., Salesforce Research 2023 · Model: Salesforce/blip2-opt-2.7b")
+def arch_svg(img_uri, out_text):
+    AR = 'stroke="#334155" stroke-width="2.4" marker-end="url(#ah)"'
+    cy = 170
 
-    st.markdown("""<div class="concept-box">
-    <strong>Core idea:</strong> Connect a frozen image encoder and a frozen large language model
-    using a lightweight trainable bridge called the QFormer. Neither backbone is updated during
-    training; only the 188M-parameter QFormer learns. This makes BLIP-2 far cheaper to train
-    than end-to-end multimodal models while achieving strong performance on captioning and VQA.
-    </div>""", unsafe_allow_html=True)
+    def arrow(x1, x2, y=cy):
+        return f'<line x1="{x1}" y1="{y}" x2="{x2}" y2="{y}" {AR}/>'
 
-    c1, c2, c3, c4 = st.columns(4)
+    def squares(x, y, n, fill, stroke, s=14, g=4):
+        return "".join(f'<rect x="{x + k * (s + g)}" y="{y}" width="{s}" height="{s}" rx="3" fill="{fill}" stroke="{stroke}" stroke-width="1.5"/>'
+                       for k in range(n))
+
+    stack = "".join(f'<rect x="{334 + c * 26}" y="{118 + r * 22}" width="20" height="17" rx="3" fill="{IMG_BG}" stroke="{IMG}" stroke-width="1.5"/>'
+                    for r in range(5) for c in range(2))
+    out_lines = wrap(out_text, 13, 4)
+    out_txt = "".join(f'<text x="1186" y="{cy - 8 * (len(out_lines) - 1) + 16 * k + 4}" text-anchor="middle" font-size="12.5" fill="#1E293B">{esc(l)}</text>'
+                      for k, l in enumerate(out_lines))
+    return f"""
+    <div class="panel">
+    <svg viewBox="0 52 1240 324" width="100%" style="font-family:Lexend, sans-serif">
+      <defs><marker id="ah" markerWidth="10" markerHeight="10" refX="8" refY="5" orient="auto">
+      <path d="M0,0 L10,5 L0,10 z" fill="#334155"/></marker></defs>
+
+      <text x="75" y="98" text-anchor="middle" font-size="16" font-weight="700" fill="{IMG}">Image</text>
+      <image href="{img_uri}" x="20" y="115" width="110" height="110" preserveAspectRatio="xMidYMid slice"/>
+      <rect x="20" y="115" width="110" height="110" fill="none" stroke="{IMG}" stroke-width="3" rx="6"/>
+      <text x="75" y="246" text-anchor="middle" font-size="13" fill="#475569">{A['image']} × {A['image']}</text>
+      {arrow(134, 156)}
+
+      <polygon points="162,80 302,115 302,225 162,260" fill="{IMG_BG}" stroke="{IMG}" stroke-width="2.5"/>
+      <text x="232" y="158" text-anchor="middle" font-size="16" font-weight="700" fill="{IMG}">Image Encoder</text>
+      <text x="232" y="180" text-anchor="middle" font-size="13.5" fill="#475569">ViT-g/14</text>
+      <text x="232" y="205" text-anchor="middle" font-size="13.5" font-weight="700" fill="{IMG}">❄ frozen</text>
+      {arrow(306, 326)}
+
+      {stack}
+      <text x="357" y="249" text-anchor="middle" font-size="13" font-weight="700" fill="#334155">{A['n_tok']} × {A['vis_hidden']}</text>
+      <text x="357" y="266" text-anchor="middle" font-size="12" fill="#475569">image features</text>
+      {arrow(388, 412)}
+
+      <rect x="418" y="66" width="194" height="210" rx="14" fill="{PROJ_BG}" stroke="{PROJ}" stroke-width="2.5"/>
+      <text x="515" y="94" text-anchor="middle" font-size="17" font-weight="800" fill="#B45309">Q-Former 🔥</text>
+      <text x="515" y="113" text-anchor="middle" font-size="12.5" fill="#B45309">trainable bridge</text>
+      {squares(441, 124, 8, "#C4B5FD", SPACE)}
+      <text x="515" y="158" text-anchor="middle" font-size="12" fill="#6D28D9">{A['n_query']} learned queries</text>
+      <rect x="436" y="168" width="158" height="26" rx="7" fill="{SPACE_BG}" stroke="{SPACE}" stroke-width="1.2"/>
+      <text x="515" y="186" text-anchor="middle" font-size="12.5" fill="#6D28D9">self-attention</text>
+      <rect x="436" y="200" width="158" height="26" rx="7" fill="#FFE4D6" stroke="#C2410C" stroke-width="1.2"/>
+      <text x="515" y="218" text-anchor="middle" font-size="12.5" fill="#9A3412">cross-attention → image</text>
+      <rect x="436" y="232" width="158" height="26" rx="7" fill="{IMG_BG}" stroke="{IMG}" stroke-width="1.2"/>
+      <text x="515" y="250" text-anchor="middle" font-size="12.5" fill="{IMG}">feed-forward</text>
+      {arrow(616, 638)}
+
+      {squares(644, cy - 7, 4, "#C4B5FD", SPACE)}
+      <text x="679" y="{cy + 34}" text-anchor="middle" font-size="13" font-weight="700" fill="#334155">{A['n_query']} × {A['q_hidden']}</text>
+      <text x="679" y="{cy + 51}" text-anchor="middle" font-size="12" fill="#475569">visual tokens</text>
+      {arrow(718, 740)}
+
+      <rect x="746" y="{cy - 38}" width="108" height="76" rx="12" fill="{NEG_BG}" stroke="{NEG}" stroke-width="2.5"/>
+      <text x="800" y="{cy - 9}" text-anchor="middle" font-size="15" font-weight="700" fill="#BE123C">Projection 🔥</text>
+      <text x="800" y="{cy + 15}" text-anchor="middle" font-size="13" fill="#475569">{A['q_hidden']} → {A['llm_hidden']}</text>
+      {arrow(858, 880)}
+
+      {squares(886, cy - 7, 4, "#C4B5FD", SPACE)}
+      <text x="921" y="{cy + 34}" text-anchor="middle" font-size="13" font-weight="700" fill="#334155">{A['n_query']} × {A['llm_hidden']}</text>
+      <text x="921" y="{cy + 51}" text-anchor="middle" font-size="12" fill="#475569">soft prompt</text>
+      {arrow(960, 982)}
+
+      <polygon points="988,115 1118,80 1118,260 988,225" fill="{TXT_BG}" stroke="{TXT}" stroke-width="2.5"/>
+      <text x="1053" y="158" text-anchor="middle" font-size="16" font-weight="700" fill="#0B7A55">Frozen LLM</text>
+      <text x="1053" y="180" text-anchor="middle" font-size="13.5" fill="#475569">OPT-2.7B</text>
+      <text x="1053" y="205" text-anchor="middle" font-size="13.5" font-weight="700" fill="#0B7A55">❄ frozen</text>
+      {arrow(1122, 1132)}
+      <rect x="1136" y="{cy - 46}" width="100" height="92" rx="10" fill="#FFFFFF" stroke="#94A3B8" stroke-width="1.5"/>
+      {out_txt}
+      <text x="1186" y="{cy - 56}" text-anchor="middle" font-size="13" font-weight="700" fill="#334155">Text out</text>
+
+      <rect x="996" y="318" width="114" height="44" rx="10" fill="#FFFFFF" stroke="{TXT}" stroke-width="2" stroke-dasharray="6 4"/>
+      <text x="1053" y="336" text-anchor="middle" font-size="13" fill="#0B7A55" font-weight="700">text prompt</text>
+      <text x="1053" y="353" text-anchor="middle" font-size="12" fill="#475569">(optional)</text>
+      <line x1="1053" y1="316" x2="1053" y2="266" {AR}/>
+
+      <text x="20" y="335" font-size="14" font-weight="700" fill="{IMG}">❄ frozen: never updated</text>
+      <text x="20" y="360" font-size="14" font-weight="700" fill="#C2410C">🔥 trainable: the only parts that learn</text>
+    </svg></div>"""
+
+
+PARAMS = [("Image encoder · ViT-g/14", 1.0, IMG, "❄ frozen"),
+          ("Q-Former + projection", 0.107, PROJ, "🔥 trained"),
+          ("LLM · OPT-2.7B", 2.7, TXT, "❄ frozen")]
+
+
+def fmt_b(b):
+    return f"{b * 1000:.0f}M" if b < 1 else f"{b:g}B"
+
+
+def param_bar():
+    total = sum(p[1] for p in PARAMS)
+    segs, legend = "", ""
+    for name, b, c, tag in PARAMS:
+        w = max(b / total * 100, 5)
+        segs += f'<div style="width:{w:.1f}%;background:{c}">{"" if w < 8 else f"{b:g}B"}</div>'
+        legend += (f'<div style="display:flex;gap:8px;align-items:center"><span style="width:14px;height:14px;'
+                   f'border-radius:4px;background:{c};display:inline-block"></span><b style="color:{NAVY}">{name}</b>'
+                   f'<span style="color:{MUTED}">{fmt_b(b)} · {tag}</span></div>')
+    pct = PARAMS[1][1] / total * 100
+    html(f"""<div class="panel">
+      <div class="ptitle">What actually gets trained?
+        <span class="tag" style="background:#FFE7D1;color:#C2410C">only {pct:.0f}% of the parameters</span></div>
+      <div class="pbar">{segs}</div>
+      <div style="display:flex;gap:26px;flex-wrap:wrap;margin-top:10px;font-size:14px">{legend}</div>
+    </div>""")
+
+
+FACTS = [
+    ("Training setup", "What the original authors used", PROJ, [
+        ("129M", "pre-training images",
+         "Image-text pairs from COCO, Visual Genome, CC3M, CC12M, SBU, and 115M images from LAION-400M."),
+        ("2", "training stages", "Stage 1 teaches the Q-Former to see. Stage 2 teaches it to talk to the LLM."),
+        ("188M", "Q-Former parameters (stage 1)",
+         "Started from BERT-base. Includes a text branch that is only needed during stage 1."),
+    ]),
+    ("This model", "The checkpoint running in this app", IMG, [
+        ("ViT-g/14", "frozen image encoder", "From EVA-CLIP, about 1B parameters, 14×14 pixel patches."),
+        ("32 × 768", "learned query tokens", "Trainable vectors that ask the image what matters for language."),
+        ("OPT-2.7B", "frozen language model", "Meta's open LLM with hidden size 2560. It never sees a gradient."),
+    ]),
+    ("Results", "Reported in the paper", POS, [
+        ("+8.7%", "over Flamingo-80B", "On zero-shot VQAv2, with the largest BLIP-2 (ViT-g + FlanT5-XXL)."),
+        ("54×", "fewer trainable parameters", "Than Flamingo-80B, because both giant backbones stay frozen."),
+    ]),
+]
+
+
+def sec_big_picture():
+    hero(1, "BLIP-2: a bridge between two frozen giants",
+         "Bootstrapping Language-Image Pre-training · Li et al., Salesforce 2023")
+    if need_images():
+        return
+    c1, _ = st.columns([1, 2])
     with c1:
-        st.markdown('<div class="metric-card"><div class="metric-val">188M</div><div class="metric-label">QFormer parameters (trained)</div></div>', unsafe_allow_html=True)
+        lbl = pick_image("s1_img", "Example image")
+    html(arch_svg(thumb_uri(POOL[lbl]["bytes"], 220), POOL[lbl]["caption"]))
+    param_bar()
+    facts_panel(FACTS, ("BLIP-2 by the numbers", "from the original paper, Li et al. 2023"))
+    key_idea("Retraining a 1B vision model or a 2.7B language model is expensive, so BLIP-2 <b>freezes both</b>. "
+             f"A small <b style='color:#C2410C'>trainable Q-Former</b> learns to turn the image into "
+             f"<b style='color:{SPACE}'>{A['n_query']} tokens</b> that the frozen LLM reads like extra words.")
+
+    with st.expander("🔍  Live parameter count (loads the model)"):
+        if model_loaded() or st.button("Count parameters", key="s1_count"):
+            model, _, _ = get_blip()
+            parts = {"Image encoder (frozen)": model.vision_model,
+                     "Q-Former + queries (trained)": model.qformer,
+                     "Projection (trained)": model.language_projection,
+                     "LLM (frozen)": model.language_model}
+            counts = {k: sum(p.numel() for p in v.parameters()) for k, v in parts.items()}
+            counts["Q-Former + queries (trained)"] += model.query_tokens.numel()
+            st.table(pd.DataFrame({"component": list(counts),
+                                   "parameters": [f"{v / 1e6:,.0f}M" for v in counts.values()]}))
+            st.caption("The paper's 188M counts the full stage 1 Q-Former, including its text branch. "
+                       "This inference checkpoint keeps only the parts used for generation.")
+
+    code_panel("load BLIP-2 and caption an image", f'''\
+from transformers import Blip2Processor, Blip2ForConditionalGeneration
+import torch
+
+processor = Blip2Processor.from_pretrained("{MODEL_ID}")
+model = Blip2ForConditionalGeneration.from_pretrained(
+    "{MODEL_ID}",
+    torch_dtype=torch.float16,   # use torch.float32 on CPU
+    device_map="auto",
+).eval()
+
+inputs = processor(images=image, return_tensors="pt").to("cuda", torch.float16)
+out = model.generate(**inputs, max_new_tokens=30)
+print(processor.decode(out[0], skip_special_tokens=True))
+
+# Sizes: ViT-g/14 about 1B (frozen) · Q-Former + projection about 107M (trained)
+#        OPT-2.7B about 2.7B (frozen) · total about 3.8B''')
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# SECTION 2 · INSIDE THE Q-FORMER
+# ═════════════════════════════════════════════════════════════════════════════
+def attn_tile(img224, a, size=104):
+    a = (a - a.min()) / (np.ptp(a) + 1e-9)
+    up = np.asarray(Image.fromarray(np.uint8(a * 255)).resize(img224.size, Image.BILINEAR), dtype=float) / 255
+    base = np.asarray(img224, dtype=float)
+    tint = np.array([255, 196, 0], dtype=float)
+    out = base * (0.18 + 0.82 * up[..., None]) * (1 - 0.25 * up[..., None]) + tint * 0.25 * up[..., None]
+    return Image.fromarray(np.uint8(np.clip(out, 0, 255))).resize((size, size))
+
+
+def sec_qformer():
+    hero(2, "Inside the Q-Former",
+         f"From {A['n_tok']} × {A['vis_hidden']} image features to {A['n_query']} language-ready vectors")
+    if need_images():
+        return
+    lbl = pick_image("s2_img")
+    b = POOL[lbl]["bytes"]
+    side = A["side"]
+    img224 = clip_crop(to_pil(b), A["image"])
+    ps = patches(img224, side)
+    seq = ('<span class="tk cls">CLS</span>' + "".join(f'<img src="{pil_uri(q)}"/>' for q in ps[:4]) +
+           '<span style="color:#64748B;font-weight:700">···</span>' + f'<img src="{pil_uri(ps[-1])}"/>')
+
+    html(f"""
+    <div class="panel">
+      <div class="ptitle"><span class="tag" style="background:{IMG_BG};color:{IMG}">1 · FROZEN</span>The image encoder turns the photo into features</div>
+      <div class="pipe">
+        <div class="node n-plain"><img class="thumb" src="{pil_uri(grid_overlay(img224, side))}" width="128"/>
+          <small>{A['image']}×{A['image']} → {side}×{side} = {side * side} patches</small></div>
+        <div class="arrow">→</div>
+        <div class="node n-img" style="width:180px"><div class="seq">{seq}</div>
+          <small>{A['n_tok']} tokens = [CLS] + {side * side} patches of {A['patch']}×{A['patch']}</small></div>
+        <div class="arrow">→</div>
+        <div class="node n-img">ViT-g/14 ❄<small>{A['vis_layers']} layers · width {A['vis_hidden']}</small></div>
+        <div class="arrow">→</div>
+        <div class="node n-img" style="font-size:18px">{A['n_tok']} × {A['vis_hidden']}<small>image features</small></div>
+      </div>
+    </div>""")
+
+    queries = "".join('<span class="vt"></span>' for _ in range(A["n_query"]))
+    outgrid = "".join('<span class="vt" style="background:#7C3AED;border-color:#5B21B6"></span>' for _ in range(A["n_query"]))
+    html(f"""
+    <div class="panel">
+      <div class="ptitle"><span class="tag" style="background:#FFE7D1;color:#C2410C">2 · TRAINABLE 🔥</span>The Q-Former asks the image questions</div>
+      <div class="pipe" style="align-items:stretch">
+        <div class="node n-space" style="width:170px;display:flex;flex-direction:column;justify-content:center">
+          <div style="line-height:0">{queries}</div>
+          <div style="margin-top:8px">{A['n_query']} learnable queries</div>
+          <small>{A['q_hidden']}-d each · not patches, not words</small></div>
+        <div class="arrow" style="align-self:center">→</div>
+        <div class="stack" style="width:330px">
+          <div class="blk" style="background:{SPACE_BG};border:1.5px solid {SPACE};color:#6D28D9">A · Self-attention
+            <small>the queries share information with each other</small></div>
+          <div class="blk" style="background:#FFE4D6;border:1.5px solid #C2410C;color:#9A3412">B · Cross-attention to the image
+            <small>Q = the {A['n_query']} queries · K, V = the {A['n_tok']} image features</small></div>
+          <div class="blk" style="background:{IMG_BG};border:1.5px solid {IMG};color:{IMG}">C · Feed-forward
+            <small>refine each query on its own</small></div>
+          <div style="text-align:center;font-weight:800;color:#B45309;font-size:14px">× {A['q_layers']} blocks
+            <span style="font-weight:500;color:#64748B">(cross-attention in every {A['cross_freq']}nd block)</span></div>
+        </div>
+        <div class="arrow" style="align-self:center">→</div>
+        <div class="node n-space" style="width:170px;display:flex;flex-direction:column;justify-content:center">
+          <div style="line-height:0">{outgrid}</div>
+          <div style="margin-top:8px">{A['n_query']} × {A['q_hidden']}</div>
+          <small>compact visual tokens, ready for the LLM</small></div>
+      </div>
+    </div>""")
+
+    big = A["n_tok"] * A["vis_hidden"]
+    small = A["n_query"] * A["q_hidden"]
+    html(f"""
+    <div class="panel">
+      <div class="ptitle">How much smaller?</div>
+      <div class="bar"><div class="track" style="height:32px"><div class="fill" style="width:100%;background:{IMG_BG}"></div>
+        <span class="lab" style="top:6px">image features · {A['n_tok']} × {A['vis_hidden']}</span></div><div class="v">{big:,}</div></div>
+      <div class="bar"><div class="track" style="height:32px"><div class="fill" style="width:{small / big * 100:.1f}%;background:#C4B5FD"></div>
+        <span class="lab" style="top:6px">Q-Former output · {A['n_query']} × {A['q_hidden']}</span></div><div class="v">{small:,}</div></div>
+      <div class="slabel" style="font-size:14px">About <b>{big / small:.0f}× fewer numbers</b>, and the LLM reads
+        <b>{A['n_query']} tokens instead of {A['n_tok']}</b>.</div>
+    </div>""")
+
+    st.markdown(f"<div style='font-weight:700;color:{NAVY};font-size:17px;margin-top:6px'>"
+                "Where does each query look?</div>", unsafe_allow_html=True)
+    sig = ("attn", lbl)
+    if run_button("Show the cross-attention of all 32 queries", "s2_run"):
+        with st.spinner("Running the image encoder and the Q-Former..."):
+            run_once("s2_res", sig, lambda: query_attention(b))
+    maps = result("s2_res", sig)
+    if maps is not None:
+        tiles = "".join(f'<div><img src="{pil_uri(attn_tile(img224, maps[k]))}"/>q{k + 1}</div>'
+                        for k in range(maps.shape[0]))
+        html(f'<div class="panel"><div class="tiles">{tiles}</div>'
+             f'<div class="slabel" style="text-align:center;font-size:14px;margin-top:8px">Bright = where that query '
+             f'pulls information from (averaged over heads and cross-attention layers)</div></div>')
+    else:
+        st.caption("Press the button to run the model. Each tile will show the image regions one query attends to.")
+
+    key_idea(f"The {A['n_query']} queries are <b>learned questions</b>. Through cross-attention they read the "
+             f"{A['n_tok']} image features and keep only what is useful for language, so the LLM gets a "
+             f"<b style='color:{SPACE}'>short, fixed-size summary</b> of any image.")
+
+    code_panel("one forward pass, step by step", f'''\
+pixel_values = processor(images=image, return_tensors="pt").pixel_values
+
+# 1. Frozen ViT-g/14
+image_embeds = model.vision_model(pixel_values).last_hidden_state   # [1, {A['n_tok']}, {A['vis_hidden']}]
+
+# 2. Q-Former: {A['n_query']} learned queries cross-attend to the image
+query_tokens = model.query_tokens.expand(1, -1, -1)                  # [1, {A['n_query']}, {A['q_hidden']}]
+q_out = model.qformer(
+    query_embeds=query_tokens,
+    encoder_hidden_states=image_embeds,
+    encoder_attention_mask=torch.ones(image_embeds.shape[:-1], dtype=torch.long),
+    output_attentions=True,                 # gives the maps shown above
+).last_hidden_state                         # [1, {A['n_query']}, {A['q_hidden']}]
+
+# 3. Linear projection into the LLM's embedding space
+soft_prompt = model.language_projection(q_out)                       # [1, {A['n_query']}, {A['llm_hidden']}]''')
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# SECTION 3 · TWO-STAGE TRAINING
+# ═════════════════════════════════════════════════════════════════════════════
+def mask_svg(kind):
+    rows = ["Q1", "Q2", "Q3", "a", "dog", "runs"]
+    nq = 3
+    n = len(rows)
+    cell, L, T = 24, 44, 36
+
+    def allowed(i, j):
+        if kind == "itc":
+            return (i < nq) == (j < nq)
+        if kind == "itm":
+            return True
+        if i < nq:                       # ITG: queries see only queries
+            return j < nq
+        return j < nq or j <= i          # text sees all queries and earlier words
+
+    out = [f'<svg viewBox="0 0 {L + n * cell + 4} {T + n * cell + 4}" width="190" style="font-family:Lexend">']
+    out.append(f'<text x="{L + n * cell / 2}" y="12" text-anchor="middle" font-size="10.5" fill="#475569">attends to →</text>')
+    for j, t in enumerate(rows):
+        out.append(f'<text x="{L + j * cell + cell / 2 - 1}" y="{T - 6}" text-anchor="middle" font-size="10" '
+                   f'fill="{SPACE if j < nq else "#0B7A55"}" font-weight="700">{t}</text>')
+    for i, t in enumerate(rows):
+        out.append(f'<text x="{L - 6}" y="{T + i * cell + 16}" text-anchor="end" font-size="10" '
+                   f'fill="{SPACE if i < nq else "#0B7A55"}" font-weight="700">{t}</text>')
+        for j in range(n):
+            ok = allowed(i, j)
+            fill = ("#A78BFA" if j < nq else "#5CC9A1") if ok else "#EEF2F7"
+            out.append(f'<rect x="{L + j * cell}" y="{T + i * cell}" width="{cell - 3}" height="{cell - 3}" rx="4" fill="{fill}"/>')
+    out.append("</svg>")
+    return "".join(out)
+
+
+def sec_training():
+    hero(3, "Two-stage training", "First teach the Q-Former to see, then teach it to talk to the LLM")
+    if need_images():
+        return
+    lbl = LABELS[0]
+    thumb = thumb_uri(POOL[lbl]["bytes"], 120)
+    cap = POOL[lbl]["caption"]
+
+    objectives = [
+        ("Image-Text Contrastive", "ITC", IMG, IMG_BG, "itc",
+         "Pull matching image and text together, push others apart. Same idea as CLIP.",
+         "Queries and text cannot see each other, so each side is summarized on its own."),
+        ("Image-Text Matching", "ITM", TXT, TXT_BG, "itm",
+         "A yes/no classifier: does this text really describe this image? Uses hard negatives.",
+         "Everything sees everything, so the queries can compare fine details with the words."),
+        ("Image-Grounded Text Generation", "ITG", SPACE, SPACE_BG, "itg",
+         "Write the caption word by word, using only what the queries extracted.",
+         "Text sees all queries but only earlier words. Queries never see the text."),
+    ]
+    cards = ""
+    for title, short, c, bg, kind, what, mask_note in objectives:
+        cards += f"""
+        <div class="step" style="border-top:5px solid {c}">
+          <h4 style="background:{bg};color:{c};min-height:58px;display:flex;align-items:center">{title} ({short})</h4>
+          <div style="font-size:14.5px;color:#1E293B;min-height:44px">{what}</div>
+          <div style="text-align:center;margin-top:8px">{mask_svg(kind)}</div>
+          <div class="slabel" style="text-align:center">{mask_note}</div>
+        </div>"""
+
+    html(f"""
+    <div class="panel" style="border-top:6px solid {IMG}">
+      <div class="ptitle"><span class="badge" style="background:{IMG};color:#fff;width:30px;height:30px;border-radius:50%;
+        display:inline-flex;align-items:center;justify-content:center">1</span>
+        Stage 1 · Vision-language representation learning
+        <span class="tag" style="background:#F1F5F9;color:#475569">no LLM involved</span></div>
+      <div class="pipe" style="margin-bottom:14px">
+        <img class="thumb" src="{thumb}" width="70"/>
+        <div class="arrow">→</div>
+        <div class="node n-img">Image encoder<small>❄ frozen</small></div>
+        <div class="arrow">→</div>
+        <div class="node" style="background:{PROJ_BG};border:2px solid {PROJ};color:#B45309">Q-Former 🔥<small>queries + text branch</small></div>
+        <div class="arrow">←</div>
+        <div class="node n-plain" style="font-weight:500;font-size:13.5px">"{esc(cap)}"</div>
+        <div class="arrow">⇒</div>
+        <div class="node n-plain">3 losses, trained together<small>L = L<sub>ITC</sub> + L<sub>ITM</sub> + L<sub>ITG</sub></small></div>
+      </div>
+      <div class="cards3">{cards}</div>
+      <div class="slabel" style="text-align:center;font-size:13.5px;margin-top:8px">
+        Grids show the self-attention mask: a colored cell means the row token may look at the column token.
+        <b style="color:{SPACE}">Q</b> = query, <b style="color:#0B7A55">green</b> = text.</div>
+    </div>""")
+
+    html(f"""
+    <div class="panel" style="border-top:6px solid {TXT}">
+      <div class="ptitle"><span class="badge" style="background:{TXT};color:#fff;width:30px;height:30px;border-radius:50%;
+        display:inline-flex;align-items:center;justify-content:center">2</span>
+        Stage 2 · Vision-to-language generative learning
+        <span class="tag" style="background:#F1F5F9;color:#475569">connect the frozen LLM</span></div>
+      <div class="pipe">
+        <img class="thumb" src="{thumb}" width="70"/>
+        <div class="arrow">→</div>
+        <div class="node n-img">Image encoder<small>❄ frozen</small></div>
+        <div class="arrow">→</div>
+        <div class="node" style="background:{PROJ_BG};border:2px solid {PROJ};color:#B45309">Q-Former 🔥<small>{A['n_query']} × {A['q_hidden']}</small></div>
+        <div class="arrow">→</div>
+        <div class="node" style="background:{NEG_BG};border:2px solid {NEG};color:#BE123C">Projection 🔥<small>{A['q_hidden']} → {A['llm_hidden']}</small></div>
+        <div class="arrow">→</div>
+        <div class="node n-txt">OPT-2.7B<small>❄ frozen</small></div>
+        <div class="arrow">→</div>
+        <div class="node n-plain" style="font-weight:500;font-size:13.5px">"{esc(cap)}"</div>
+      </div>
+      <div class="slabel" style="font-size:14px;margin-top:10px">Loss: ordinary next-word prediction on the caption.
+        The gradient flows back <b>through</b> the frozen LLM, but only the Q-Former and projection change.</div>
+    </div>""")
+
+    rows = [("Image encoder (ViT-g/14)", "fz", "fz"), ("Q-Former", "tr", "tr"),
+            ("Projection", "na", "tr"), ("LLM (OPT-2.7B)", "na", "fz")]
+    name = {"fz": "❄ frozen", "tr": "🔥 trained", "na": "not used"}
+    body = "".join(f'<tr><td>{r}</td><td><span class="flag {a}">{name[a]}</span></td>'
+                   f'<td><span class="flag {b2}">{name[b2]}</span></td></tr>' for r, a, b2 in rows)
+    html(f'<table class="cmp"><tr><th></th><th style="color:{IMG}">Stage 1</th><th style="color:#0B7A55">Stage 2</th></tr>{body}</table>')
+
+    key_idea("Stage 1 teaches the queries <b>what to look for</b> using three objectives at once. "
+             "Stage 2 teaches them to <b>speak the LLM's language</b>. "
+             f"The two giants stay <b style='color:{IMG}'>frozen</b> the whole time.")
+
+    code_panel("the training losses (pseudo-code)", f'''\
+# Stage 1 (no LLM): image features from the frozen ViT, plus the caption text
+q = qformer(queries, image_feats)               # [B, {A['n_query']}, {A['q_hidden']}]
+loss_itc = contrastive(q, text_cls)             # unimodal mask: queries and text apart
+loss_itm = bce(match_head(qformer_joint(q, text)), is_match)   # bidirectional mask
+loss_itg = lm_loss(qformer_causal(q, text), text)              # causal text, queries visible
+loss = loss_itc + loss_itm + loss_itg
+
+# Stage 2: plug in the frozen LLM
+soft_prompt = projection(qformer(queries, image_feats))        # [B, {A['n_query']}, {A['llm_hidden']}]
+logits = llm(inputs_embeds=cat([soft_prompt, embed(caption)]))
+loss = cross_entropy(logits, caption)           # only Q-Former + projection get updated''')
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# SECTION 4 · CAPTIONING
+# ═════════════════════════════════════════════════════════════════════════════
+def llm_input_html(prompt_parts, answer_words, answer_label):
+    pr = "".join(prompt_parts) if prompt_parts else f'<span class="tk pr" style="font-style:italic">no text prompt</span>'
+    ans = ("".join(f'<span class="tk ans">{esc(w)}</span>' for w in answer_words[:14]) +
+           ("<span style='color:#64748B;font-weight:700'> ···</span>" if len(answer_words) > 14 else "")) \
+        if answer_words else f'<span class="tk pr">?</span>'
+    return f"""
+    <div class="panel">
+      <div class="ptitle">What the frozen LLM reads, and what it writes</div>
+      <div class="pipe" style="align-items:stretch">
+        <div class="node n-space" style="display:flex;flex-direction:column;justify-content:center">
+          <div>{vtokens(8, A['n_query'], big=True)}</div><small>{A['n_query']} visual tokens from the Q-Former</small></div>
+        <div class="arrow" style="align-self:center">+</div>
+        <div class="node n-plain" style="display:flex;flex-direction:column;justify-content:center;max-width:340px">
+          <div class="seq">{pr}</div><small>text prompt</small></div>
+        <div class="arrow" style="align-self:center">→</div>
+        <div class="node n-txt" style="display:flex;flex-direction:column;justify-content:center">OPT-2.7B<small>❄ frozen</small></div>
+        <div class="arrow" style="align-self:center">→</div>
+        <div class="node n-plain" style="display:flex;flex-direction:column;justify-content:center;max-width:360px">
+          <div class="seq">{ans}</div><small>{answer_label}</small></div>
+      </div>
+    </div>"""
+
+
+def sec_caption():
+    hero(4, "Image captioning", "No text prompt: the LLM simply describes what the visual tokens show")
+    if need_images():
+        return
+    c1, c2, c3 = st.columns([1.1, 1, 1])
+    with c1:
+        lbl = pick_image("s4_img")
+        html(f'<img class="thumb" src="{thumb_uri(POOL[lbl]["bytes"], 260)}" style="width:100%;max-width:260px"/>')
     with c2:
-        st.markdown('<div class="metric-card"><div class="metric-val">32</div><div class="metric-label">Learnable query tokens</div></div>', unsafe_allow_html=True)
+        max_tok = st.slider("Max new tokens", 10, 80, 30, 5, key="s4_max")
+        sample = st.toggle("Sampling (more variety)", value=True, key="s4_sample")
     with c3:
-        st.markdown('<div class="metric-card"><div class="metric-val">2</div><div class="metric-label">Training stages</div></div>', unsafe_allow_html=True)
-    with c4:
-        st.markdown('<div class="metric-card"><div class="metric-val">❄️ x2</div><div class="metric-label">Frozen backbones</div></div>', unsafe_allow_html=True)
+        temp = st.slider("Temperature", 0.3, 1.5, 1.0, 0.1, key="s4_temp", disabled=not sample)
+        n = st.slider("How many captions", 1, 5, 3, key="s4_n", disabled=not sample)
 
-    st.divider()
-    st.subheader("The Three-Part Architecture")
+    n = n if sample else 1
+    sig = ("cap", lbl, max_tok, sample, temp if sample else None, n)
+    if run_button("Generate captions", "s4_run"):
+        with st.spinner("Image → ViT → Q-Former → OPT ..."):
+            run_once("s4_res", sig, lambda: blip_generate(POOL[lbl]["bytes"], None, max_tok, sample, temp, n))
+    caps = result("s4_res", sig)
 
-    col1, col2, col3 = st.columns(3)
-    with col1:
-        st.markdown("""<div class="highlight-box">
-        <strong>❄️ Frozen Image Encoder</strong><br><br>
-        ViT-G/14 from EVA-CLIP.<br>
-        1.8 billion parameters.<br>
-        Never updated during BLIP-2 training.<br>
-        Outputs a set of visual patch features.
-        </div>""", unsafe_allow_html=True)
+    html(llm_input_html(None, caps[0].split() if caps else [], "generated caption"))
+    if caps:
+        html("".join(f'<div class="out"><small>Caption {k + 1}</small>{esc(c)}</div>' for k, c in enumerate(caps)))
+    else:
+        st.caption("Press the button to run BLIP-2. Results appear here.")
 
-    with col2:
-        st.markdown("""<div class="concept-box">
-        <strong>🔥 QFormer (Trainable)</strong><br><br>
-        188M parameters, the only part that trains.<br>
-        32 learnable query tokens attend to image features via cross-attention.<br>
-        Outputs 32 fixed-length vectors regardless of image size.<br>
-        Shared self-attention layers for text and queries.
-        </div>""", unsafe_allow_html=True)
+    key_idea("With no prompt, the LLM continues from the visual tokens alone, so it writes a caption. "
+             "<b>Sampling</b> picks each next word at random from the model's probabilities. Higher "
+             "<b>temperature</b> flattens those probabilities: more variety, more mistakes.")
 
-    with col3:
-        st.markdown("""<div class="highlight-box">
-        <strong>❄️ Frozen LLM</strong><br><br>
-        OPT-2.7B in this app (also available with FlanT5).<br>
-        2.7 billion parameters.<br>
-        Never updated during BLIP-2 training.<br>
-        Receives QFormer output as soft prompt tokens.
-        </div>""", unsafe_allow_html=True)
-
-    st.divider()
-    st.subheader("Two-Stage Training Strategy")
-
-    col_a, col_b = st.columns(2)
-    with col_a:
-        st.markdown("**Stage 1: Vision-Language Representation Learning**")
-        st.markdown("""<div class="concept-box">
-        No LLM involved. Just the frozen image encoder and QFormer.<br><br>
-        Three simultaneous objectives:<br>
-        1. Image-Text Contrastive (like CLIP, aligning matching pairs)<br>
-        2. Image-Text Matching (binary: does this pair match?)<br>
-        3. Image-Grounded Text Generation (generate caption from visual features)
-        </div>""", unsafe_allow_html=True)
-
-        st.code(
-            "# Stage 1 -- QFormer learns to extract\n"
-            "# language-relevant visual features\n\n"
-            "# Input: image patches from frozen ViT\n"
-            "# Queries: 32 learnable tokens\n"
-            "# Output: 32 visual feature vectors\n\n"
-            "# Three losses trained jointly:\n"
-            "# L = L_itc + L_itm + L_itg",
-            language="python"
-        )
-
-    with col_b:
-        st.markdown("**Stage 2: Vision-to-Language Generative Learning**")
-        st.markdown("""<div class="concept-box">
-        Now the frozen LLM is connected.<br><br>
-        QFormer output (32 vectors) passes through a linear projection layer
-        and is prepended to the LLM input as soft visual prompt tokens.<br><br>
-        The LLM sees these as additional context before the text.<br>
-        Only QFormer and the linear projection are updated.
-        </div>""", unsafe_allow_html=True)
-
-        st.code(
-            "# Stage 2 -- Connect QFormer to frozen LLM\n\n"
-            "# 1. Encode image with frozen ViT\n"
-            "visual_features = vit(image)       # [N_patches, 1408]\n\n"
-            "# 2. QFormer extracts key info\n"
-            "query_output = qformer(visual_features)  # [32, 768]\n\n"
-            "# 3. Linear projection to LLM space\n"
-            "soft_prompts = linear(query_output)  # [32, 2560]\n\n"
-            "# 4. Prepend to LLM input\n"
-            "output = llm(soft_prompts, text_tokens)",
-            language="python"
-        )
-
-    st.divider()
-    st.subheader("Loading BLIP-2 from HuggingFace")
-
-    st.code(
-        "from transformers import Blip2Processor, Blip2ForConditionalGeneration\n"
-        "import torch\n\n"
-        "processor = Blip2Processor.from_pretrained('Salesforce/blip2-opt-2.7b')\n"
-        "model = Blip2ForConditionalGeneration.from_pretrained(\n"
-        "    'Salesforce/blip2-opt-2.7b',\n"
-        "    torch_dtype=torch.float16,  # use float32 on CPU\n"
-        "    device_map='auto'           # auto GPU placement\n"
-        ")\n"
-        "model.eval()\n\n"
-        "# Model sizes:\n"
-        "# Vision encoder (ViT-G/14):  ~1.8B params -- FROZEN\n"
-        "# QFormer:                    ~188M params -- TRAINABLE\n"
-        "# Language model (OPT-2.7B):  ~2.7B params -- FROZEN",
-        language="python"
-    )
-
-    st.markdown("""<div class="warning-box">
-    <strong>First run note:</strong> The model is approximately 3.7GB and downloads automatically
-    from HuggingFace on first launch. Subsequent runs load from the local cache.
-    GPU with at least 8GB VRAM is recommended for comfortable inference speed.
-    </div>""", unsafe_allow_html=True)
+    code_panel("captioning", f'''\
+inputs = processor(images=image, return_tensors="pt").to(device, dtype)
+out = model.generate(
+    **inputs,
+    max_new_tokens={max_tok},
+    do_sample={sample},{f"""
+    temperature={temp}, top_p=0.9,
+    num_return_sequences={n},""" if sample else ""}
+)
+captions = processor.batch_decode(out, skip_special_tokens=True)''')
 
 
 # ═════════════════════════════════════════════════════════════════════════════
-# SECTION 2: THE QFORMER BRIDGE
+# SECTION 5 · QUESTION ANSWERING
 # ═════════════════════════════════════════════════════════════════════════════
-elif section.startswith("2"):
-    st.markdown('<span class="section-tag">SECTION 2</span>', unsafe_allow_html=True)
-    st.title("The QFormer Bridge")
-    st.caption("Inspecting the learnable bridge between the frozen vision encoder and the frozen LLM")
-
-    st.markdown("""<div class="concept-box">
-    The QFormer is the only part of BLIP-2 that is trained. It contains 32 learnable query tokens
-    that attend to image patch features via cross-attention and extract the most language-relevant
-    visual information. The output is always exactly 32 vectors, a fixed-length summary of
-    the image that the LLM can process efficiently.
-    </div>""", unsafe_allow_html=True)
-
-    with st.spinner("Loading BLIP-2, this may take a minute on first run..."):
-        model, processor, device = load_blip2()
-    st.success("BLIP-2 loaded: Salesforce/blip2-opt-2.7b")
-
-    st.divider()
-    st.subheader("Parameter Count: The Asymmetry That Makes BLIP-2 Efficient")
-
-    components = {
-        "Vision Encoder (ViT-G/14): FROZEN": sum(
-            p.numel() for p in model.vision_model.parameters()
-        ),
-        "QFormer: TRAINABLE": sum(
-            p.numel() for p in model.qformer.parameters()
-        ),
-        "Language Model (OPT-2.7B): FROZEN": sum(
-            p.numel() for p in model.language_model.parameters()
-        ),
-    }
-
-    col1, col2, col3 = st.columns(3)
-    cols = [col1, col2, col3]
-    colors = ["#1565C0", "#FFB300", "#2E7D32"]
-    labels = ["Frozen", "Trainable", "Frozen"]
-
-    for i, (name, count) in enumerate(components.items()):
-        with cols[i]:
-            color = colors[i]
-            st.markdown(
-                f'<div class="metric-card">'
-                f'<div class="metric-val" style="color:{color}">{count/1e9:.2f}B</div>'
-                f'<div class="metric-label">{name}</div>'
-                f'</div>',
-                unsafe_allow_html=True
-            )
-
-    total = sum(components.values())
-    trainable = components["QFormer: TRAINABLE"]
-    pct = trainable / total * 100
-
-    st.markdown(f"""<div class="success-box">
-    <strong>Only {pct:.1f}% of total parameters are trained.</strong>
-    The QFormer ({trainable/1e6:.0f}M params) does all the learning while
-    {(total-trainable)/1e9:.1f}B parameters in the two frozen backbones stay fixed.
-    This is what makes BLIP-2 trainable on a fraction of the compute of end-to-end models.
-    </div>""", unsafe_allow_html=True)
-
-    st.divider()
-    st.subheader("QFormer Architecture Details")
-
-    if st.button("Inspect QFormer config"):
-        cfg = model.config.qformer_config
-        st.json({
-            "num_hidden_layers":      cfg.num_hidden_layers,
-            "num_attention_heads":    cfg.num_attention_heads,
-            "hidden_size":            cfg.hidden_size,
-            "intermediate_size":      cfg.intermediate_size,
-            "num_query_tokens":       model.config.num_query_tokens,
-            "cross_attention_freq":   cfg.cross_attention_frequency,
-            "encoder_hidden_size":    cfg.encoder_hidden_size,
-        })
-
-    st.divider()
-    st.subheader("The 32 Learnable Query Tokens")
-
-    st.markdown("""<div class="concept-box">
-    The query tokens are randomly initialized embedding vectors that learn during training
-    to ask the right questions of the image. They are not image patches; they are
-    trainable parameters that selectively pull out the visual information most useful
-    for language tasks via cross-attention over the ViT patch features.
-    </div>""", unsafe_allow_html=True)
-
-    st.code(
-        "# Inspect the learnable query tokens\n"
-        "query_tokens = model.query_tokens\n"
-        "print(query_tokens.shape)\n"
-        "# torch.Size([1, 32, 768])\n"
-        "# 1 = batch dim, 32 = number of queries, 768 = hidden size\n\n"
-        "# These 32 x 768 = 24,576 values are the only parameters\n"
-        "# that directly interface with the image encoder output.\n"
-        "# Everything the LLM knows about the image comes through them.",
-        language="python"
-    )
-
-    if st.button("Show query token statistics"):
-        qt = model.query_tokens.detach().cpu().float().numpy()
-        st.markdown(f"""<div class="highlight-box">
-        <strong>Query token tensor shape:</strong> {qt.shape}<br>
-        <strong>Mean value:</strong> {qt.mean():.4f}<br>
-        <strong>Std deviation:</strong> {qt.std():.4f}<br>
-        <strong>Min:</strong> {qt.min():.4f} &nbsp;&nbsp; <strong>Max:</strong> {qt.max():.4f}<br><br>
-        These values were randomly initialized and learned entirely during BLIP-2 training.
-        </div>""", unsafe_allow_html=True)
-
-        fig, ax = make_fig(9, 3)
-        vals = qt[0].flatten()
-        ax.hist(vals, bins=80, color="#1565C0", alpha=0.8, edgecolor="white", linewidth=0.3)
-        ax.set_xlabel("Token value")
-        ax.set_ylabel("Count")
-        ax.set_title("Distribution of learned query token values (32 tokens x 768 dims = 24,576 values)")
-        ax.axvline(vals.mean(), color="#FFB300", linewidth=2, linestyle="--", label=f"Mean: {vals.mean():.3f}")
-        ax.legend(labelcolor="#334155")
-        plt.tight_layout()
-        st.pyplot(fig)
-        plt.close()
-
-    st.divider()
-    st.subheader("Information Flow Through the QFormer")
-
-    st.code(
-        "# Full forward pass -- step by step\n\n"
-        "# Step 1: encode image with frozen ViT\n"
-        "pixel_values = processor(images=image, return_tensors='pt').pixel_values\n"
-        "image_embeds = model.vision_model(pixel_values).last_hidden_state\n"
-        "# shape: [1, 257, 1408]  -- 256 patches + 1 CLS token, 1408-dim features\n\n"
-        "# Step 2: QFormer cross-attends to image features\n"
-        "image_atts = torch.ones(image_embeds.size()[:-1], dtype=torch.long)\n"
-        "query_tokens = model.query_tokens.expand(1, -1, -1)\n"
-        "query_output = model.qformer(\n"
-        "    query_embeds=query_tokens,\n"
-        "    encoder_hidden_states=image_embeds,\n"
-        "    encoder_attention_mask=image_atts,\n"
-        ")\n"
-        "# shape: [1, 32, 768]  -- 32 queries distilled image info\n\n"
-        "# Step 3: project to LLM input space\n"
-        "language_model_inputs = model.language_projection(query_output.last_hidden_state)\n"
-        "# shape: [1, 32, 2560]  -- ready for OPT-2.7B\n\n"
-        "# Step 4: frozen LLM generates text\n"
-        "outputs = model.language_model.generate(inputs_embeds=language_model_inputs)",
-        language="python"
-    )
+QUICK_QS = ["What is in this image?", "How many animals are there?", "What color is it?",
+            "Where was this photo taken?", "What is happening?"]
+FORMATS = {"Question: … Answer:": "Question: {q} Answer:", "Raw question": "{q}"}
 
 
-# ═════════════════════════════════════════════════════════════════════════════
-# SECTION 3: IMAGE CAPTIONING
-# ═════════════════════════════════════════════════════════════════════════════
-elif section.startswith("3"):
-    st.markdown('<span class="section-tag">SECTION 3</span>', unsafe_allow_html=True)
-    st.title("Image Captioning")
-    st.caption("Upload any image and let BLIP-2 describe it using the full frozen pipeline")
-
-    st.markdown("""<div class="concept-box">
-    Image captioning is BLIP-2's most direct capability. The frozen ViT encodes the image,
-    the QFormer distills it into 32 visual tokens, a linear projection maps them to the LLM
-    input space, and the frozen OPT-2.7B generates a natural language description.
-    No text prompt is needed; the model generates freely from the visual tokens alone.
-    </div>""", unsafe_allow_html=True)
-
-    with st.spinner("Loading BLIP-2..."):
-        model, processor, device = load_blip2()
-
-    st.divider()
-    uploaded = st.file_uploader("Upload an image to caption", type=["png","jpg","jpeg","webp"])
-
-    col_img, col_cfg = st.columns([1, 1])
-
-    with col_img:
-        if uploaded:
-            img = Image.open(uploaded).convert("RGB")
-            st.image(img, use_container_width=True)
-
-    with col_cfg:
-        st.subheader("Generation settings")
-        max_tokens = st.slider("Max new tokens", 20, 150, 60, 10)
-        n_captions = st.slider("Number of captions to generate", 1, 5, 3,
-                               help="Generate multiple captions with sampling to see variation")
-        do_sample  = st.checkbox("Use sampling (adds diversity)", value=True)
-        temperature = st.slider("Temperature", 0.5, 1.5, 1.0, 0.1,
-                                disabled=not do_sample)
-
-        st.markdown("""<div class="warning-box">
-        <strong>CPU note:</strong> Each caption takes 20-40 seconds on CPU.
-        GPU inference is under 2 seconds.
-        </div>""", unsafe_allow_html=True)
-
-    if uploaded and st.button("Generate Captions"):
-        img = Image.open(uploaded).convert("RGB")
-        dtype = torch.float16 if device == "cuda" else torch.float32
-        inputs = processor(images=img, return_tensors="pt").to(device, dtype)
-
-        captions = []
-        with st.spinner(f"Generating {n_captions} caption(s)..."):
-            for i in range(n_captions):
-                with torch.no_grad():
-                    if do_sample:
-                        out = model.generate(
-                            **inputs,
-                            max_new_tokens=max_tokens,
-                            do_sample=True,
-                            temperature=temperature,
-                        )
-                    else:
-                        out = model.generate(**inputs, max_new_tokens=max_tokens)
-                cap = processor.decode(out[0], skip_special_tokens=True).strip()
-                captions.append(cap)
-
-        st.divider()
-        st.subheader("Generated Captions")
-        for i, cap in enumerate(captions):
-            st.markdown(f"""<div class="success-box">
-            <strong>Caption {i+1}:</strong> {cap}
-            </div>""", unsafe_allow_html=True)
-
-        st.divider()
-        st.subheader("What Happened Under the Hood")
-        st.code(
-            "# 1. Processor prepares the image\n"
-            "inputs = processor(images=image, return_tensors='pt')\n"
-            "# pixel_values shape: [1, 3, 224, 224]\n\n"
-            "# 2. Full pipeline: ViT -> QFormer -> Linear -> OPT\n"
-            "output_ids = model.generate(\n"
-            "    **inputs,\n"
-            f"    max_new_tokens={max_tokens},\n"
-            f"    do_sample={do_sample},\n"
-            + (f"    temperature={temperature},\n" if do_sample else "") +
-            ")\n\n"
-            "# 3. Decode token IDs back to text\n"
-            "caption = processor.decode(output_ids[0], skip_special_tokens=True)",
-            language="python"
-        )
-
-        st.markdown("""<div class="concept-box">
-        <strong>Why do captions vary?</strong> When sampling is on, the LLM draws from a
-        probability distribution over next tokens at each step rather than always picking
-        the most likely token. Temperature controls how spread out that distribution is.
-        Higher temperature = more diverse but sometimes less accurate. Lower = more
-        deterministic but potentially repetitive.
-        </div>""", unsafe_allow_html=True)
+def _set_q(q):
+    st.session_state["s5_q"] = q
 
 
-# ═════════════════════════════════════════════════════════════════════════════
-# SECTION 4: VISUAL QUESTION ANSWERING
-# ═════════════════════════════════════════════════════════════════════════════
-elif section.startswith("4"):
-    st.markdown('<span class="section-tag">SECTION 4</span>', unsafe_allow_html=True)
-    st.title("Visual Question Answering")
-    st.caption("Ask any natural language question about an image")
+def sec_vqa():
+    hero(5, "Visual question answering", "Same visual tokens, now followed by your question")
+    if need_images():
+        return
+    c1, c2 = st.columns([1, 2.2])
+    with c1:
+        lbl = pick_image("s5_img")
+        html(f'<img class="thumb" src="{thumb_uri(POOL[lbl]["bytes"], 240)}" style="width:100%;max-width:240px"/>')
+    with c2:
+        if "s5_q" not in st.session_state:
+            st.session_state["s5_q"] = QUICK_QS[0]
+        q = st.text_input("Your question", key="s5_q")
+        qc = st.columns(len(QUICK_QS))
+        for k, qq in enumerate(QUICK_QS):
+            with qc[k]:
+                st.button(qq, key=f"s5_quick_{k}", on_click=_set_q, args=(qq,))
+        fmt = seg("Prompt format", list(FORMATS), key="s5_fmt")
+        max_tok = st.slider("Max answer length (tokens)", 5, 60, 20, 5, key="s5_max")
 
-    st.markdown("""<div class="concept-box">
-    VQA is where BLIP-2's language model capabilities really show. You provide both an image
-    and a text question. The QFormer extracts visual features, the linear projection maps them
-    to the LLM input space, and the question is appended as text tokens. The frozen OPT
-    generates a natural language answer conditioned on both.
-    </div>""", unsafe_allow_html=True)
-
-    with st.spinner("Loading BLIP-2..."):
-        model, processor, device = load_blip2()
-
-    st.divider()
-    col_l, col_r = st.columns([1, 1.1])
-
-    with col_l:
-        st.subheader("Upload Image")
-        uploaded = st.file_uploader("Choose an image", type=["png","jpg","jpeg","webp"])
-        if uploaded:
-            img = Image.open(uploaded).convert("RGB")
-            st.image(img, use_container_width=True)
-
-    with col_r:
-        st.subheader("Ask a Question")
-        default_questions = [
-            "What is in this image?",
-            "What color is the main object?",
-            "How many people are in the image?",
-            "What is happening in this scene?",
-            "What time of day does this appear to be?",
-        ]
-        question = st.text_input("Your question:", value="What is in this image?")
-
-        st.markdown("**Or try one of these:**")
-        for q in default_questions:
-            if st.button(q, key=f"btn_{q}"):
-                question = q
-
-        max_tokens_vqa = st.slider("Max answer length (tokens)", 20, 120, 50, 10)
-
-    if uploaded and question and st.button("Get Answer"):
-        img = Image.open(uploaded).convert("RGB")
-
+    prompt = FORMATS[fmt].replace("{q}", q.strip())
+    sig = ("vqa", lbl, prompt, max_tok)
+    if run_button("Answer", "s5_run"):
         with st.spinner("Thinking..."):
-            answer = answer_question(model, processor, img, question, device, max_tokens_vqa)
+            run_once("s5_res", sig, lambda: blip_generate(POOL[lbl]["bytes"], prompt, max_tok)[0])
+    ans = result("s5_res", sig)
 
-        st.divider()
-        st.markdown(f"""<div class="success-box">
-        <strong>Question:</strong> {question}<br><br>
-        <strong>Answer:</strong> {answer}
-        </div>""", unsafe_allow_html=True)
+    parts = []
+    for w in prompt.split():
+        cls = "fmt" if w in ("Question:", "Answer:") else "pr"
+        parts.append(f'<span class="tk {cls}">{esc(w)}</span>')
+    html(llm_input_html(parts, ans.split() if ans else [], "answer"))
+    if ans:
+        html(f'<div class="out"><small>Q: {esc(q)}</small>{esc(ans)}</div>')
+    else:
+        st.caption("Press the button to run BLIP-2.")
 
-        st.code(
-            "# VQA forward pass\n"
-            f'prompt = "Question: {question} Answer:"\n\n'
-            "inputs = processor(\n"
-            "    images=image,\n"
-            "    text=prompt,\n"
-            "    return_tensors='pt'\n"
-            ")\n\n"
-            "output_ids = model.generate(\n"
-            "    **inputs,\n"
-            f"    max_new_tokens={max_tokens_vqa}\n"
-            ")\n"
-            "answer = processor.decode(output_ids[0], skip_special_tokens=True)",
-            language="python"
-        )
+    with st.expander("🧪  Experiment: ask several questions about the same image"):
+        qs_txt = st.text_area("One question per line",
+                              value="What is the main subject?\nWhat colors stand out?\n"
+                                    "Describe the background.\nGive a one-word answer: what is this?",
+                              height=120, key="s5_multi")
+        qs = [x.strip() for x in qs_txt.splitlines() if x.strip()]
+        sig2 = ("multi", lbl, tuple(qs), fmt)
+        if run_button("Answer all", "s5_run_all"):
+            with st.spinner(f"Answering {len(qs)} questions..."):
+                run_once("s5_multi_res", sig2,
+                         lambda: [blip_generate(POOL[lbl]["bytes"], FORMATS[fmt].replace("{q}", x), 30)[0] for x in qs])
+        answers = result("s5_multi_res", sig2)
+        if answers:
+            m = max(len(a.split()) for a in answers) or 1
+            rows = "".join(
+                f'<tr><td style="padding:8px 10px;font-weight:600;color:{NAVY}">{esc(x)}</td>'
+                f'<td style="padding:8px 10px">{esc(a)}</td>'
+                f'<td style="padding:8px 10px;width:22%">{bars_html([f"{len(a.split())} words"], [len(a.split())], [TXT_BG], lambda v: "", m)}</td></tr>'
+                for x, a in zip(qs, answers))
+            html(f'<table class="cmp"><tr><th>question</th><th>answer</th><th>length</th></tr>{rows}</table>')
 
-        st.markdown("""<div class="concept-box">
-        <strong>How it works:</strong> The prompt format "Question: ... Answer:" is a soft
-        instruction that primes the frozen OPT to produce a concise answer rather than
-        a free-form caption. The visual tokens from the QFormer are prepended to this
-        text prompt so the LLM attends to both image and question simultaneously.
-        </div>""", unsafe_allow_html=True)
+    key_idea("The frozen OPT was <b>never trained on question answering</b>. The "
+             f"<b style='color:#B45309'>\"Question: … Answer:\"</b> format primes it to reply briefly. "
+             "Switch to the raw question and compare: prompt wording changes what you get.")
 
-    st.divider()
-    st.subheader("Multi-Question Comparison")
-    st.markdown("Ask several questions about the same image at once to see how the model handles different reasoning types.")
+    code_panel("visual question answering", f'''\
+prompt = "{esc(prompt)}"
+inputs = processor(images=image, text=prompt, return_tensors="pt").to(device, dtype)
+out = model.generate(**inputs, max_new_tokens={max_tok})
+answer = processor.decode(out[0], skip_special_tokens=True)
+answer = answer.split("Answer:")[-1].strip()   # some versions echo the prompt''')
 
-    uploaded2 = st.file_uploader("Upload image for comparison", type=["png","jpg","jpeg","webp"], key="vqa2")
 
-    default_multi = (
-        "What is the main subject of this image?\n"
-        "What colors are most prominent?\n"
-        "Describe the background.\n"
-        "What mood does this image convey?"
-    )
-    multi_qs = st.text_area("Questions (one per line):", value=default_multi, height=130)
-
-    if uploaded2 and st.button("Answer All Questions"):
-        img2 = Image.open(uploaded2).convert("RGB")
-        questions = [q.strip() for q in multi_qs.strip().split("\n") if q.strip()]
-
-        st.image(img2, width=300)
-        st.divider()
-
-        for q in questions:
-            with st.spinner(f"Answering: {q}"):
-                ans = answer_question(model, processor, img2, q, device, 60)
-            st.markdown(f"""<div class="highlight-box">
-            <strong>Q:</strong> {q}<br>
-            <strong>A:</strong> {ans}
-            </div>""", unsafe_allow_html=True)
+def bars_html(names, values, colors, fmt, scale_max=None):
+    m = scale_max or max(max(values), 1e-6)
+    out = ""
+    for nm, v, c in zip(names, values, colors):
+        w = max(v, 0) / m * 100
+        out += (f'<div class="bar"><div class="track"><div class="fill" style="width:{w:.0f}%;background:{c}"></div>'
+                f'<span class="lab">{esc(nm)}</span></div><div class="v">{fmt(v)}</div></div>')
+    return out
 
 
 # ═════════════════════════════════════════════════════════════════════════════
-# SECTION 5: PROMPT ENGINEERING
+# SECTION 6 · BLIP-2 VS CLIP
 # ═════════════════════════════════════════════════════════════════════════════
-elif section.startswith("5"):
-    st.markdown('<span class="section-tag">SECTION 5</span>', unsafe_allow_html=True)
-    st.title("Prompt Engineering for BLIP-2")
-    st.caption("How question phrasing changes the answer (same image, different prompts)")
+def sec_vs_clip():
+    hero(6, "BLIP-2 vs CLIP", "Same image, two very different kinds of output")
+    if need_images():
+        return
+    c1, c2, c3 = st.columns([1, 1.2, 1.4])
+    with c1:
+        lbl = pick_image("s6_img")
+        html(f'<img class="thumb" src="{thumb_uri(POOL[lbl]["bytes"], 220)}" style="width:100%;max-width:220px"/>')
+    with c2:
+        labels_txt = st.text_area("Labels for CLIP (one per line)", value="\n".join(LABELS), height=170, key="s6_labels")
+    with c3:
+        question = st.text_input("Question for BLIP-2", value="What is in this image?", key="s6_q")
+        st.caption("CLIP scores each label with the prompt \"a photo of a {label}.\"")
 
-    st.markdown("""<div class="concept-box">
-    BLIP-2 uses a frozen OPT language model whose behavior is shaped by how the prompt
-    is constructed. The same visual content can yield very different answers depending
-    on how the question is phrased. This section lets you explore that sensitivity
-    directly, the same principle as prompt engineering for text-only LLMs, but
-    now applied across both vision and language.
-    </div>""", unsafe_allow_html=True)
+    labels = list(dict.fromkeys(x.strip() for x in labels_txt.splitlines() if x.strip()))
+    sig = ("vs", lbl, tuple(labels), question)
+    if run_button("Run both models", "s6_run"):
+        def both():
+            s, p = clip_scores(POOL[lbl]["bytes"], [f"a photo of {article(x)} {x}." for x in labels])
+            cap = blip_generate(POOL[lbl]["bytes"], None, 30)[0]
+            ans = blip_generate(POOL[lbl]["bytes"], f"Question: {question} Answer:", 20)[0]
+            return s, p, cap, ans
+        with st.spinner("Running CLIP and BLIP-2..."):
+            run_once("s6_res", sig, both)
+    res = result("s6_res", sig)
 
-    with st.spinner("Loading BLIP-2..."):
-        model, processor, device = load_blip2()
+    left, right = st.columns(2)
+    with left:
+        if res:
+            s, p, _, _ = res
+            order = np.argsort(-p)[:6]
+            bars = bars_html([labels[i] for i in order], [p[i] for i in order],
+                             [POS_BG if k == 0 else "#E2E8F0" for k in range(len(order))],
+                             lambda v: f"{v * 100:.1f}%", 1.0)
+        else:
+            bars = f'<div class="slabel">Press ▶ to see CLIP\'s ranking.</div>'
+        html(f"""<div class="panel" style="border-top:6px solid {IMG}">
+          <div class="ptitle"><span class="tag" style="background:{IMG_BG};color:{IMG}">CLIP</span>chooses from a list</div>
+          <div class="pipe" style="margin-bottom:10px">
+            <div class="node n-img">image encoder</div><div class="arrow">+</div>
+            <div class="node n-txt">text encoder</div><div class="arrow">→</div>
+            <div class="node n-space">cosine scores</div></div>
+          {bars}</div>""")
+    with right:
+        if res:
+            _, _, cap, ans = res
+            outs = (f'<div class="out"><small>Caption (no prompt)</small>{esc(cap)}</div>'
+                    f'<div class="out"><small>Q: {esc(question)}</small>{esc(ans)}</div>')
+        else:
+            outs = f'<div class="slabel">Press ▶ to see what BLIP-2 writes.</div>'
+        html(f"""<div class="panel" style="border-top:6px solid {TXT}">
+          <div class="ptitle"><span class="tag" style="background:{TXT_BG};color:#0B7A55">BLIP-2</span>writes new words</div>
+          <div class="pipe" style="margin-bottom:10px">
+            <div class="node n-img">ViT-g ❄</div><div class="arrow">→</div>
+            <div class="node" style="background:{PROJ_BG};border:2px solid {PROJ};color:#B45309">Q-Former 🔥</div>
+            <div class="arrow">→</div><div class="node n-txt">OPT ❄</div><div class="arrow">→</div>
+            <div class="node n-plain">text</div></div>
+          {outs}</div>""")
 
-    st.divider()
-    uploaded = st.file_uploader("Upload an image", type=["png","jpg","jpeg","webp"])
-    if uploaded:
-        img = Image.open(uploaded).convert("RGB")
-        st.image(img, width=350)
+    rows = [
+        ("Output", "Similarity scores between embeddings", "Generated text"),
+        ("Main tasks", "Retrieval, ranking, zero-shot classification", "Captioning, question answering"),
+        ("Image encoder", "ViT-B/32, trained from scratch with the text encoder", "ViT-g/14 from EVA-CLIP, frozen"),
+        ("Language side", "Text encoder, trained jointly", "Frozen OPT-2.7B LLM"),
+        ("Bridge", "None: two projections into one shared space", "Q-Former with 32 learned queries"),
+        ("Training signal", "Contrastive (InfoNCE) only", "Stage 1: ITC + ITM + ITG · Stage 2: next-word prediction"),
+        ("Answers limited to", "The labels you supply", "Anything the LLM can write"),
+    ]
+    body = "".join(f"<tr><td>{a}</td><td>{b}</td><td>{c}</td></tr>" for a, b, c in rows)
+    html(f'<table class="cmp"><tr><th></th><th style="color:{IMG}">CLIP</th>'
+         f'<th style="color:#0B7A55">BLIP-2</th></tr>{body}</table>')
 
-    st.subheader("Compare Prompt Variants")
-    st.markdown("Define a core topic and several ways of asking about it. BLIP-2 will answer each.")
+    key_idea(f"<b style='color:{IMG}'>CLIP chooses</b>: it can only rank the options you give it. "
+             f"<b style='color:{TXT}'>BLIP-2 writes</b>: it generates new words. In fact BLIP-2's stage 1 "
+             "contains a CLIP-style contrastive loss, so it builds on the same idea.")
 
-    col_l, col_r = st.columns(2)
-    with col_l:
-        topic = st.text_input("Core topic:", value="the main object")
-    with col_r:
-        max_tok = st.slider("Max tokens per answer", 20, 100, 50, 10)
+    code_panel("running both", '''\
+# CLIP: score fixed labels
+probs = (clip.logit_scale.exp() * img_emb @ text_embs.T).softmax(-1)
 
-    default_prompts = (
-        "What is {topic}?\n"
-        "Describe {topic} in detail.\n"
-        "What can you tell me about {topic}?\n"
-        "Is there {topic} in this image?\n"
-        "Give a one-word answer: what is {topic}?"
-    )
-    prompt_template = st.text_area(
-        "Prompt variants (use {topic} as placeholder, one per line):",
-        value=default_prompts, height=160
-    )
-
-    if uploaded and st.button("Run Prompt Comparison"):
-        img = Image.open(uploaded).convert("RGB")
-        raw_prompts = [
-            p.strip().replace("{topic}", topic)
-            for p in prompt_template.strip().split("\n") if p.strip()
-        ]
-
-        st.divider()
-        st.subheader("Results")
-
-        answers = []
-        for prompt in raw_prompts:
-            with st.spinner(f"Running: {prompt[:50]}..."):
-                ans = answer_question(model, processor, img, prompt, device, max_tok)
-            answers.append((prompt, ans))
-
-        for prompt, ans in answers:
-            st.markdown(f"""<div class="highlight-box">
-            <strong>Prompt:</strong> {prompt}<br>
-            <strong>Answer:</strong> {ans}
-            </div>""", unsafe_allow_html=True)
-
-        st.divider()
-        st.subheader("Answer Length Comparison")
-        fig, ax = make_fig(8, 3.5)
-        lengths = [len(ans.split()) for _, ans in answers]
-        short_prompts = [p[:35] + "..." if len(p) > 35 else p for p, _ in answers]
-        bars = ax.barh(range(len(answers)), lengths, color="#1565C0", height=0.5)
-        ax.set_yticks(range(len(answers)))
-        ax.set_yticklabels(short_prompts, color="#334155", fontsize=10)
-        ax.set_xlabel("Answer length (words)")
-        ax.set_title("How prompt phrasing affects answer verbosity")
-        for i, v in enumerate(lengths):
-            ax.text(v + 0.3, i, str(v), va="center", color="#334155", fontsize=10)
-        plt.tight_layout()
-        st.pyplot(fig)
-        plt.close()
-
-        st.markdown("""<div class="warning-box">
-        <strong>Key observation:</strong> Open-ended prompts ("Describe...") produce longer,
-        richer answers. Closed-ended prompts ("Is there...") produce shorter confirmations.
-        Explicit constraints ("Give a one-word answer") are respected by the LLM but not
-        always perfectly; the frozen backbone was not instruction-tuned for strict
-        output formatting.
-        </div>""", unsafe_allow_html=True)
-
-    st.divider()
-    st.subheader("Captioning vs VQA Mode")
-    st.markdown("""<div class="concept-box">
-    BLIP-2 operates in two modes depending on whether a text prompt is provided:<br><br>
-    <strong>No prompt (captioning mode):</strong> The LLM generates freely from visual tokens alone.
-    Output tends to be a descriptive sentence starting with "a photo of..." or similar.<br><br>
-    <strong>With prompt (VQA mode):</strong> The text prompt is appended after the visual tokens.
-    The LLM generates text conditioned on both image and question.
-    Use "Question: ... Answer:" format for best VQA results.
-    </div>""", unsafe_allow_html=True)
-
-    st.code(
-        "# Captioning mode -- no text prompt\n"
-        "inputs = processor(images=image, return_tensors='pt')\n"
-        "output = model.generate(**inputs, max_new_tokens=50)\n\n"
-        "# VQA mode -- with text prompt\n"
-        "inputs = processor(\n"
-        "    images=image,\n"
-        '    text="Question: What is in this image? Answer:",\n'
-        "    return_tensors='pt'\n"
-        ")\n"
-        "output = model.generate(**inputs, max_new_tokens=50)",
-        language="python"
-    )
+# BLIP-2: generate free text
+caption = processor.decode(model.generate(**processor(images=image, return_tensors="pt"))[0],
+                           skip_special_tokens=True)''')
 
 
 # ═════════════════════════════════════════════════════════════════════════════
-# SECTION 6: BLIP-2 VS CLIP
+# NAVIGATION
 # ═════════════════════════════════════════════════════════════════════════════
-elif section.startswith("6"):
-    st.markdown('<span class="section-tag">SECTION 6</span>', unsafe_allow_html=True)
-    st.title("BLIP-2 vs CLIP: Two Different Outputs from the Same Image")
-    st.caption("Making the architectural difference concrete")
+SECTIONS = {
+    "1 · Big picture": sec_big_picture,
+    "2 · Inside the Q-Former": sec_qformer,
+    "3 · Two-stage training": sec_training,
+    "4 · Captioning": sec_caption,
+    "5 · Question answering": sec_vqa,
+    "6 · BLIP-2 vs CLIP": sec_vs_clip,
+}
+NAMES = list(SECTIONS)
 
-    st.markdown("""<div class="concept-box">
-    CLIP and BLIP-2 both process images and text, but they produce fundamentally different
-    outputs. CLIP produces embedding vectors for similarity and retrieval.
-    BLIP-2 produces generated natural language for understanding and description.
-    This section runs both on the same image so you can see the difference directly.
-    </div>""", unsafe_allow_html=True)
+if "sec" not in st.session_state:
+    st.session_state.sec = NAMES[0]
+if "last_sec" not in st.session_state:
+    st.session_state.last_sec = NAMES[0]
 
-    # Load BLIP-2
-    with st.spinner("Loading BLIP-2..."):
-        model, processor, device = load_blip2()
 
-    # Load CLIP separately
-    @st.cache_resource(show_spinner=True)
-    def load_clip_for_comparison():
-        from transformers import CLIPProcessor, CLIPModel
-        clip_model = CLIPModel.from_pretrained("openai/clip-vit-base-patch32")
-        clip_proc  = CLIPProcessor.from_pretrained("openai/clip-vit-base-patch32")
-        clip_model.eval()
-        return clip_model, clip_proc
+def _keep_sec():
+    if st.session_state.sec is None:          # segmented control was clicked off
+        st.session_state.sec = st.session_state.last_sec
+    st.session_state.last_sec = st.session_state.sec
 
-    with st.spinner("Loading CLIP..."):
-        clip_model, clip_proc = load_clip_for_comparison()
 
-    st.success("Both models loaded.")
-    st.divider()
+def _go(delta):
+    i = NAMES.index(st.session_state.sec) + delta
+    st.session_state.sec = NAMES[max(0, min(len(NAMES) - 1, i))]
+    st.session_state.last_sec = st.session_state.sec
 
-    uploaded = st.file_uploader("Upload an image", type=["png","jpg","jpeg","webp"])
-    candidate_texts = st.text_area(
-        "Candidate labels for CLIP (one per line):",
-        value=(
-            "a photo of a dog\n"
-            "a photo of a cat\n"
-            "a photo of a car\n"
-            "a photo of food\n"
-            "a photo of a person\n"
-            "a photo of nature"
-        ),
-        height=160
-    )
-    question_for_blip = st.text_input(
-        "Question for BLIP-2 VQA:",
-        value="What is in this image?"
-    )
 
-    if uploaded and st.button("Run Both Models"):
-        img = Image.open(uploaded).convert("RGB")
+try:
+    nav_box = st.container(key="topnav")
+except TypeError:                              # Streamlit < 1.39 has no container keys
+    nav_box = st.container()
+with nav_box:
+    if hasattr(st, "segmented_control"):
+        st.segmented_control("Section", NAMES, key="sec", on_change=_keep_sec, label_visibility="collapsed")
+    else:
+        st.radio("Section", NAMES, key="sec", on_change=_keep_sec, horizontal=True, label_visibility="collapsed")
 
-        col_l, col_r = st.columns(2)
-        with col_l:
-            st.image(img, use_container_width=True, caption="Input image")
+current = st.session_state.sec or st.session_state.last_sec
+SECTIONS[current]()
 
-        # Run CLIP
-        candidates = [c.strip() for c in candidate_texts.strip().split("\n") if c.strip()]
-        with st.spinner("Running CLIP..."):
-            clip_inputs = clip_proc(
-                images=img, text=candidates,
-                return_tensors="pt", padding=True
-            )
-            with torch.no_grad():
-                img_feat  = clip_model.get_image_features(pixel_values=clip_inputs["pixel_values"])
-                txt_feats = clip_model.get_text_features(
-                    input_ids=clip_inputs["input_ids"],
-                    attention_mask=clip_inputs["attention_mask"]
-                )
-            img_feat  = img_feat  / img_feat.norm(dim=-1, keepdim=True)
-            txt_feats = txt_feats / txt_feats.norm(dim=-1, keepdim=True)
-            scores = (img_feat @ txt_feats.T).squeeze().cpu().numpy()
+st.markdown("")
+idx = NAMES.index(current)
+b1, _, b2 = st.columns([1, 4, 1])
+with b1:
+    if idx > 0:
+        st.button(f"← {NAMES[idx - 1][4:]}", on_click=_go, args=(-1,), key="prev")
+with b2:
+    if idx < len(NAMES) - 1:
+        st.button(f"{NAMES[idx + 1][4:]} →", on_click=_go, args=(1,), key="next")
 
-        # Run BLIP-2 captioning
-        with st.spinner("Running BLIP-2 captioning..."):
-            caption = generate_caption(model, processor, img, device)
-
-        # Run BLIP-2 VQA
-        with st.spinner("Running BLIP-2 VQA..."):
-            vqa_answer = answer_question(
-                model, processor, img, question_for_blip, device
-            )
-
-        st.divider()
-        col_clip, col_blip = st.columns(2)
-
-        with col_clip:
-            st.subheader("CLIP Output")
-            st.markdown("""<div class="highlight-box">
-            <strong>What CLIP produces:</strong> Similarity scores.<br>
-            CLIP cannot generate text. It ranks candidate labels by how
-            closely each matches the image in the shared embedding space.
-            </div>""", unsafe_allow_html=True)
-
-            sorted_idx = np.argsort(scores)[::-1]
-            fig, ax = make_fig(5, max(3, len(candidates) * 0.55))
-            y_pos = list(range(len(candidates)))
-            sorted_scores = scores[sorted_idx]
-            sorted_labels = [candidates[i] for i in sorted_idx]
-            bar_cols = (
-                ["#1B5E20"] +
-                ["#1565C0"] * min(2, len(candidates)-1) +
-                ["#90A4AE"] * max(0, len(candidates)-3)
-            )
-            ax.barh(y_pos, sorted_scores[::-1], color=list(reversed(bar_cols)), height=0.6)
-            ax.set_yticks(y_pos)
-            ax.set_yticklabels(sorted_labels[::-1], color="#334155", fontsize=10)
-            ax.set_xlabel("Cosine similarity")
-            ax.set_title("CLIP: ranked similarity scores")
-            for i, s in enumerate(sorted_scores[::-1]):
-                ax.text(s + 0.002, i, f"{s:.3f}", va="center", color="#1A2332", fontsize=9)
-            plt.tight_layout()
-            st.pyplot(fig)
-            plt.close()
-
-            st.markdown(f"""<div class="success-box">
-            <strong>Top match:</strong> {sorted_labels[0]}<br>
-            <strong>Score:</strong> {sorted_scores[0]:.4f}<br><br>
-            Output is a number between -1 and +1. No language generated.
-            </div>""", unsafe_allow_html=True)
-
-        with col_blip:
-            st.subheader("BLIP-2 Output")
-            st.markdown("""<div class="highlight-box">
-            <strong>What BLIP-2 produces:</strong> Generated natural language.<br>
-            BLIP-2 does not rank candidates; it generates free-form text
-            using the frozen OPT language model conditioned on visual tokens.
-            </div>""", unsafe_allow_html=True)
-
-            st.markdown(f"""<div class="success-box">
-            <strong>Caption (no prompt):</strong><br>
-            {caption}
-            </div>""", unsafe_allow_html=True)
-
-            st.markdown(f"""<div class="success-box">
-            <strong>VQA answer:</strong><br>
-            Q: {question_for_blip}<br>
-            A: {vqa_answer}
-            </div>""", unsafe_allow_html=True)
-
-        st.divider()
-        st.subheader("Architecture Comparison")
-
-        rows = [
-            ["", "CLIP", "BLIP-2"],
-            ["Output type", "Embedding vector (512-dim)", "Generated text (natural language)"],
-            ["Primary task", "Retrieval and similarity", "Captioning and VQA"],
-            ["Image encoder", "ViT-B/32 (trained jointly)", "ViT-G/14 (frozen)"],
-            ["Language side", "Text encoder (frozen after training)", "Frozen OPT-2.7B LLM"],
-            ["Bridge", "None (shared projection space)", "QFormer (32 learnable queries)"],
-            ["Training signal", "Contrastive (InfoNCE)", "Generation (cross-entropy)"],
-            ["Zero-shot?", "Yes, any candidate labels", "Yes, no fine-tuning required"],
-        ]
-
-        st.table(
-            {
-                "": [r[0] for r in rows[1:]],
-                "CLIP": [r[1] for r in rows[1:]],
-                "BLIP-2": [r[2] for r in rows[1:]],
-            }
-        )
-
-        st.markdown("""<div class="concept-box">
-        <strong>When to use which:</strong><br>
-        Use <strong>CLIP</strong> when your task is retrieval, ranking, filtering, or zero-shot
-        classification, any time a similarity score is sufficient.<br><br>
-        Use <strong>BLIP-2</strong> when your task requires understanding and generating language
-        about an image: captioning, VQA, visual reasoning, or any task where a score
-        is not enough and you need words.
-        </div>""", unsafe_allow_html=True)
